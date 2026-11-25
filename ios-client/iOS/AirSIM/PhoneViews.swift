@@ -237,6 +237,12 @@ struct DialPadLayoutMetrics {
 // MARK: - 拨号
 
 struct DialPadView: View {
+    let lineTitle: String
+    let canDial: Bool
+    let canChooseLine: Bool
+    let chooseLine: () -> Void
+    let chooseAndroid: (String) -> Void
+    let submit: () -> Void
     @EnvironmentObject private var model: AppModel
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -326,17 +332,6 @@ struct DialPadView: View {
                                             .lineLimit(1)
                                     }
                                     .accessibilityIdentifier("dial-pad-device-selector")
-                                    let slots = model.simSlots(for: currentAgent.id)
-                                    if slots.count > 1 {
-                                        CompactSIMPicker(slots: slots,
-                                            selectedID: model.selectedSIMSlotID(for: currentAgent.id),
-                                            select: { model.selectSIMSlot($0.id, for: currentAgent.id) }) {
-                                            Label(slots.first(where: { $0.id == model.selectedSIMSlotID(for: currentAgent.id) })?.displayName ?? "选择通话卡",
-                                                  systemImage: "simcard.2")
-                                                .lineLimit(1)
-                                        }
-                                        .accessibilityIdentifier("dial-pad-sim-slot")
-                                    }
                                 } else if agentSection == .bluetooth {
                                     Label(model.voble.state == .ready ? "VoBLE · 已认证" : "VoBLE · 等待连接", systemImage: "wave.3.right")
                                         .foregroundStyle(.secondary)
@@ -346,6 +341,11 @@ struct DialPadView: View {
                                     }
                                     .accessibilityIdentifier("dial-pad-device-selector")
                                 }
+                                Button(action: chooseLine) {
+                                    Label(lineTitle, systemImage: "simcard.2").lineLimit(1)
+                                }
+                                .disabled(!canChooseLine)
+                                .accessibilityIdentifier("dial-pad-sim-slot")
                             }
                             .font(.caption)
                             .buttonStyle(.plain)
@@ -374,9 +374,7 @@ struct DialPadView: View {
                 PairedAndroidAgentsView(
                     agents: model.pairedAndroidAgents,
                     cloudModeEnabled: CloudModePreference.isEnabled(),
-                    selectAgent: { agentID in
-                        model.bindAndroidAgent(agentID)
-                    }
+                    selectAgent: chooseAndroid
                 )
             }
             .sheet(isPresented: $showingNewContact, onDismiss: {
@@ -429,9 +427,7 @@ struct DialPadView: View {
             .disabled(model.numberInput.isEmpty)
             .opacity(model.numberInput.isEmpty ? 0.4 : 1)
             .accessibilityLabel("号码操作")
-            Button {
-                Task { await model.dial() }
-            } label: {
+            Button(action: submit) {
                 Circle()
                     .fill(.green)
                     .frame(width: metrics.keySize, height: metrics.keySize)
@@ -442,12 +438,10 @@ struct DialPadView: View {
                     }
             }
             .buttonStyle(.plain)
-            .disabled(
-                model.numberInput.isEmpty
-                    || model.isBusy
-                    || !model.canStartOutgoingCommand
-            )
-            .opacity(model.numberInput.isEmpty || !model.canStartOutgoingCommand ? 0.4 : 1)
+            .disabled(model.numberInput.isEmpty || !canDial)
+            .opacity(model.numberInput.isEmpty || !canDial ? 0.4 : 1)
+            .accessibilityLabel("拨号")
+            .accessibilityHint(lineTitle)
 
             Image(systemName: "delete.left")
                 .font(.system(size: metrics.deleteIconSize))
@@ -824,16 +818,47 @@ enum DialToneTiming {
 struct RecentsView: View {
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var contacts: ContactStore
+    @Environment(\.scenePhase) private var scenePhase
+    @StateObject private var systemHistory = SystemCallHistory()
+    @ObservedObject private var mailbox = IPhoneMailbox.shared
+    @State private var isVisible = false
     let onCall: (String) -> Void
     let onMessage: (String) -> Void
     @State private var pendingDeletion: Set<String> = []
     @State private var confirmingDeletion = false
+    @State private var deletionProblem: String?
     @State private var searchText = ""
     @State private var missedOnly = false
     @State private var selectedGroupID: String?
+    private var allRecords: [CallRecord] {
+        SystemCallEntry.combinedRecords(android: model.callHistory, imported: mailbox.importedCalls,
+                                        system: Array(systemHistory.entries.values))
+    }
+    private func isImported(_ call: CallRecord) -> Bool { call.id.hasPrefix("iphone-import:") }
+    private func source(_ call: CallRecord) -> String {
+        if systemHistory.entries[call.id] != nil { return "iPhone 系统通话" }
+        if isImported(call) { return "iPhone 导入记录" }
+        return call.slotIndex.map { "安卓 SIM \($0 + 1)" } ?? "安卓网关"
+    }
+    private func title(_ call: CallRecord) -> String {
+        if call.number == nil, let system = systemHistory.entries[call.id] { return system.displayParticipants }
+        return contacts.displayName(for: call.number)
+    }
+    private func status(_ call: CallRecord) -> String {
+        if let system = systemHistory.entries[call.id] {
+            let direction = call.direction == "incoming" ? "呼入" : call.direction == "outgoing" ? "呼出" : ""
+            return [direction, system.status].filter { !$0.isEmpty }.joined(separator: " · ")
+        }
+        return call.missed ? "未接来电" : call.direction == "incoming" ? "呼入" : "呼出"
+    }
     private var groups: [RecentCallGroup] {
-        RecentCallGroup.grouped(model.callHistory.filter { !missedOnly || ($0.direction == "incoming" && $0.missed) }).filter { group in
-            group.records.contains { PhoneContentSearch.numberMatches($0.number, query: searchText) }
+        RecentCallGroup.grouped(allRecords.filter { !missedOnly || ($0.direction == "incoming" && $0.missed) }).filter { group in
+            group.records.contains { record in
+                PhoneContentSearch.numberMatches(record.number, query: searchText)
+                    || (systemHistory.entries[record.id]?.participants.contains {
+                        PhoneContentSearch.numberMatches($0.phone, query: searchText)
+                    } ?? false)
+            }
         }
     }
     var body: some View {
@@ -851,7 +876,13 @@ struct RecentsView: View {
                                      bottom: 12, trailing: PhoneListMetrics.horizontalInset))
                 .accessibilityIdentifier("recents.filter")
 
-                if groups.isEmpty {
+                if let problem = systemHistory.problem {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(problem).font(.footnote).foregroundStyle(.secondary)
+                        Button("重试读取 iPhone 通话记录") { systemHistory.refresh() }
+                    }
+                }
+                if groups.isEmpty && !systemHistory.loading {
                     EmptyStateView(title: searchText.isEmpty ? (missedOnly ? "暂无未接来电" : L10n.t("暂无通话记录")) : "未找到匹配号码",
                                    systemImage: searchText.isEmpty ? (missedOnly ? "phone.badge.checkmark" : "phone.arrow.up.right") : "magnifyingglass")
                         .listRowBackground(Color.clear)
@@ -860,13 +891,13 @@ struct RecentsView: View {
                 ForEach(groups) { group in
                     Button { selectedGroupID = group.id } label: {
                         HStack(spacing: PhoneListMetrics.avatarSpacing) {
-                            InitialAvatar(name: contacts.displayName(for: group.latest.number),
+                            InitialAvatar(name: title(group.latest),
                                 photoData: group.latest.number.flatMap { contacts.contact(for: $0)?.photoData },
                                 fallbackContent: RecentAvatarPolicy.content(contactName: group.latest.number.flatMap { contacts.contact(for: $0)?.name }),
                                 size: PhoneListMetrics.avatarSize, neutralFallback: true)
                             VStack(alignment: .leading, spacing: 3) {
                                 HStack(spacing: 6) {
-                                    Text(contacts.displayName(for: group.latest.number))
+                                    Text(title(group.latest))
                                         .font(.body.weight(.semibold))
                                         .foregroundStyle(group.latest.missed ? Color.red : Color.primary)
                                         .lineLimit(1)
@@ -881,8 +912,7 @@ struct RecentsView: View {
                                 HStack(spacing: 5) {
                                     Image(systemName: group.latest.missed ? "phone.badge.xmark" : group.latest.direction == "incoming" ? "arrow.down.left" : "arrow.up.right")
                                         .accessibilityHidden(true)
-                                    Text([group.latest.missed ? "未接来电" : group.latest.direction == "incoming" ? "呼入" : "呼出",
-                                          group.latest.slotIndex.map { "SIM \($0 + 1)" } ?? "SIM 未记录"].joined(separator: " · "))
+                                    Text([status(group.latest), source(group.latest)].joined(separator: " · "))
                                     if group.records.contains(where: { model.unseenMissedCallIDs.contains($0.id) }) {
                                         Text("未查看").foregroundStyle(.red)
                                     }
@@ -906,12 +936,24 @@ struct RecentsView: View {
                     .alignmentGuide(.listRowSeparatorLeading) { _ in PhoneListMetrics.separatorLeading }
                     .swipeActions(edge: .leading, allowsFullSwipe: false) {
                         if group.records.contains(where: { model.unseenMissedCallIDs.contains($0.id) }) {
-                            Button { model.markMissedCallsSeen(group.records) } label: { Label("标为已读", systemImage: "checkmark") }
+                            Button { model.markMissedCallsSeen(group.records.filter { systemHistory.entries[$0.id] == nil && !isImported($0) }) } label: { Label("标为已读", systemImage: "checkmark") }
                         }
                     }
                     .swipeActions(allowsFullSwipe: false) {
-                        Button(role: .destructive) { pendingDeletion = RecentCallGroup.grouped(model.callHistory).first { $0.id == group.id }?.recordIDs ?? group.recordIDs; confirmingDeletion = true } label: { Label("删除全部记录", systemImage: "trash") }
+                        let editable = Set(group.records.lazy.filter { systemHistory.entries[$0.id] == nil }.map(\.id))
+                        if !editable.isEmpty {
+                            Button(role: .destructive) { pendingDeletion = editable; confirmingDeletion = true } label: {
+                                Label("删除 AirSIM 中的记录", systemImage: "trash")
+                            }
+                        }
                     }
+                }
+                if systemHistory.hasOlder {
+                    Button("载入更早的 iPhone 系统记录") { systemHistory.loadOlder() }
+                        .disabled(systemHistory.loading)
+                }
+                if systemHistory.loading {
+                    ProgressView("正在读取 iPhone 通话记录")
                 }
             }
             .listStyle(.plain)
@@ -926,10 +968,11 @@ struct RecentsView: View {
             }
             .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索号码")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) { IPhoneHistoryImportButton() }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         Button { model.markMissedCallsSeen() } label: {
-                            Label("将全部未接来电标为已读", systemImage: "checkmark.circle")
+                            Label("将安卓未接来电标为已读", systemImage: "checkmark.circle")
                         }
                         .accessibilityIdentifier("recents.markAllSeen")
                         .disabled(model.unseenMissedCallIDs.isEmpty)
@@ -938,12 +981,28 @@ struct RecentsView: View {
                     .accessibilityIdentifier("recents.actions")
                 }
             }
-            .confirmationDialog("删除该号码的全部本机通话记录？", isPresented: $confirmingDeletion, titleVisibility: .visible) {
+            .confirmationDialog("删除所选 AirSIM 记录和导入副本？", isPresented: $confirmingDeletion, titleVisibility: .visible) {
                 Button("删除 \(pendingDeletion.count) 条记录", role: .destructive) {
-                    model.deleteCallHistory(ids: pendingDeletion)
+                    let androidIDs = Set(model.callHistory.map(\.id)).intersection(pendingDeletion)
+                    if !androidIDs.isEmpty { model.deleteCallHistory(ids: androidIDs) }
+                    do {
+                        for id in pendingDeletion where id.hasPrefix("iphone-import:") {
+                            try mailbox.removeImportedCall(id: id)
+                        }
+                    } catch { deletionProblem = error.localizedDescription }
                     pendingDeletion = []
                 }
-            } message: { Text("仅删除此 iPhone 的 AirSIM 历史，不操作安卓系统记录。") }
+            } message: { Text("iPhone 和安卓的系统通话记录会保留。") }
+            .alert("删除导入副本失败", isPresented: Binding(get: { deletionProblem != nil },
+                set: { if !$0 { deletionProblem = nil } })) {
+                Button("好") { deletionProblem = nil }
+            } message: { Text(deletionProblem ?? "") }
+        }
+        .onAppear { isVisible = true; if scenePhase == .active { systemHistory.start() } }
+        .onDisappear { isVisible = false; systemHistory.stop() }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active && isVisible { systemHistory.start() }
+            else if phase == .background { systemHistory.stop() }
         }
     }
     private func quickAction(_ title: String, _ symbol: String) -> some View {
@@ -953,18 +1012,25 @@ struct RecentsView: View {
         }.frame(maxWidth: .infinity, minHeight: 52)
     }
     @ViewBuilder private func detail(_ id: String) -> some View {
-        let records = RecentCallGroup.grouped(model.callHistory).first { $0.id == id }?.records ?? []
+        let records = RecentCallGroup.grouped(allRecords).first { $0.id == id }?.records ?? []
         List {
             if let first = records.first {
                 Section {
                     VStack(spacing: 10) {
-                        Text(contacts.displayName(for: first.number)).font(.title2.bold()).multilineTextAlignment(.center)
+                        Text(title(first)).font(.title2.bold()).multilineTextAlignment(.center)
                         if let number = first.number { Text(number).font(.body.monospacedDigit()).textSelection(.enabled) }
                         if let info = PhoneRegionLookup.infoLine(number: first.number, slotIndex: first.slotIndex) {
                             Label(info, systemImage: first.slotIndex == nil ? "mappin.and.ellipse" : "simcard")
                                 .font(.subheadline).foregroundStyle(.secondary)
                         }
                         Text("\(records.count) 次通话").font(.subheadline).foregroundStyle(.secondary)
+                        if let entry = systemHistory.entries[first.id], entry.participants.count > 1 {
+                            ForEach(Array(entry.participants.enumerated()), id: \.offset) { _, participant in
+                                if let number = participant.phone {
+                                    Button { onCall(number) } label: { Label(participant.label, systemImage: "phone") }
+                                }
+                            }
+                        }
                         if let number = RecentCallDialPolicy.numberToDial(first.number) {
                             HStack(spacing: 12) {
                                 Button { onCall(number) } label: { quickAction("呼出", "phone.fill") }
@@ -980,13 +1046,12 @@ struct RecentsView: View {
                             Image(systemName: call.missed ? "phone.badge.xmark" : call.direction == "incoming" ? "phone.arrow.down.left" : "phone.arrow.up.right")
                                 .foregroundStyle(call.missed ? Color.red : Color.accentColor).frame(width: 30, height: 44)
                             VStack(alignment: .leading, spacing: 6) {
-                                Text(call.missed ? "未接来电" : call.direction == "incoming" ? "呼入" : "呼出").font(.headline)
+                                Text(status(call)).font(.headline)
                                 Text(call.startedAt.formatted(date: .abbreviated, time: .standard)).foregroundStyle(.secondary)
-                                Label(call.slotIndex.map { "SIM \($0 + 1)" } ?? "SIM 未记录", systemImage: "simcard").font(.caption).foregroundStyle(.secondary)
+                                Label(source(call), systemImage: "simcard").font(.caption).foregroundStyle(.secondary)
                                 if call.missed { Text("未接通").font(.caption).foregroundStyle(.red) }
-                                else if let duration = call.connectedDuration { Text("通话时长 \(Int(duration) / 60) 分 \(Int(duration) % 60) 秒").font(.caption).foregroundStyle(.secondary) }
+                                else if let duration = systemHistory.entries[call.id]?.duration ?? call.connectedDuration { Text("通话时长 \(Int(duration) / 60) 分 \(Int(duration) % 60) 秒").font(.caption).foregroundStyle(.secondary) }
                                 else { Text("通话时长未记录").font(.caption).foregroundStyle(.secondary) }
-                                if let slot = call.slotIndex, slot >= 0 { Text("SIM \(slot + 1)").font(.caption).foregroundStyle(.secondary) }
                             }
                         }.padding(.vertical, 5)
                     }
@@ -995,8 +1060,11 @@ struct RecentsView: View {
         }
         .listStyle(.insetGrouped).scrollContentBackground(.hidden).background(PhoneBackdrop())
         .navigationTitle("通话详情")
-        .onAppear { model.markMissedCallsSeen(records) }.navigationBarTitleDisplayMode(.inline)
-        .onAppear { model.markMissedCallsSeen(records) }
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            let android = records.filter { systemHistory.entries[$0.id] == nil && !isImported($0) }
+            if !android.isEmpty { model.markMissedCallsSeen(android) }
+        }
     }
 }
 
@@ -1122,9 +1190,10 @@ struct MessagesView: View {
         Group {
             // Outside explicit deletion mode, row taps belong to navigation, not selection.
             List(selection: state.editMode.isEditing ? $state.selectedConversations : nil) {
+                IPhoneCarrierThreads(query: state.searchText)
                 if conversations.isEmpty {
                     EmptyStateView(title: state.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        ? L10n.t("暂无短信") : L10n.t("未找到匹配的短信"), systemImage: "message")
+                        ? L10n.t("暂无安卓短信") : L10n.t("未找到匹配的安卓短信"), systemImage: "message")
                         .listRowBackground(Color.clear)
                 } else {
                     ForEach(conversations, id: \.sender) { conversation in
@@ -1661,7 +1730,18 @@ private final class SMSMessageShareItem: NSObject, UIActivityItemSource {
     }
 }
 
+private enum ComposerSender: Equatable {
+    case android
+    case iPhone(String)
+}
+
 private struct MessageComposer: View {
+    @ObservedObject private var carrier = IPhoneCarrierMessaging.shared
+    @State private var sender: ComposerSender?
+    @State private var kind = "SMS"
+    @State private var attachment: IPhoneCarrierAttachment?
+    @State private var encrypted = false
+    @State private var sendError: String?
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var model: AppModel
     @State private var recipient: String
@@ -1686,22 +1766,109 @@ private struct MessageComposer: View {
         }.prefix(5))
     }
 
+    private var localLine: IPhoneMessagingLine? {
+        guard case let .iPhone(id) = sender else { return nil }
+        return carrier.lines.first { $0.id == id }
+    }
+
+    private func protocols(for line: IPhoneMessagingLine) -> [String] {
+        var kinds: [String] = []
+        if line.supportsSMS { kinds.append("SMS") }
+        if line.supportsMMS { kinds.append("MMS") }
+        if line.supportsRCS { kinds.append("RCS") }
+        return kinds
+    }
+
+    private var eligibleLines: [IPhoneMessagingLine] {
+        carrier.lines.filter { !protocols(for: $0).isEmpty }
+    }
+
+    private var hasAndroid: Bool {
+        !model.pairedAndroidAgents.isEmpty || AndroidAgentBindingPreference.selected() != nil || model.canStartOutgoingCommand
+    }
+
+    private func chooseInitialSender() {
+        guard sender == nil else { return }
+        if hasAndroid || !carrier.isConfigured { sender = .android }
+        else if eligibleLines.count == 1, let line = eligibleLines.first { selectSender(.iPhone(line.id)) }
+    }
+
+    private func selectSender(_ route: ComposerSender) {
+        if route == .android, attachment != nil || encrypted {
+            sendError = "要改用安卓短信，请先移除附件并关闭 RCS 加密。"
+            return
+        }
+        sender = route
+        if let line = localLine, !protocols(for: line).contains(kind), attachment == nil, !encrypted,
+           let first = protocols(for: line).first { kind = first }
+    }
+
+    private var senderTitle: String {
+        switch sender {
+        case .android: return "安卓"
+        case .iPhone: return localLine.map { "iPhone · " + $0.label } ?? "所选 iPhone 线路已不可用"
+        case nil: return "选择发件线路"
+        }
+    }
+
     private var canSend: Bool {
-        !recipient.trimmingCharacters(in: .whitespaces).isEmpty
-            && !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !sending
+        let hasBody = !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard !sending, !recipient.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, hasBody || attachment != nil else { return false }
+        switch sender {
+        case .android: return hasBody && attachment == nil && !encrypted
+        case .iPhone:
+            guard carrier.isConfigured, let line = localLine, protocols(for: line).contains(kind) else { return false }
+            if encrypted && kind != "RCS" { return false }
+            if attachment != nil { return kind == "MMS" || (kind == "RCS" && content.isEmpty) }
+            return true
+        case nil: return false
+        }
+    }
+
+    private var senderControls: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Menu {
+                    Button("安卓短信") { selectSender(.android) }
+                    ForEach(eligibleLines) { line in
+                        Button("iPhone · " + line.label) { selectSender(.iPhone(line.id)) }
+                    }
+                } label: {
+                    Label(senderTitle, systemImage: "simcard.2")
+                }.accessibilityLabel("发件线路，" + senderTitle)
+                if sender == .android { SMSAccountPicker(recipient: recipient) }
+                if let line = localLine {
+                    Menu(kind) {
+                        ForEach(protocols(for: line), id: \.self) { item in
+                            Button(item) {
+                                if (item == "SMS" && attachment != nil) || (item != "RCS" && encrypted) {
+                                    sendError = "请先移除附件或关闭 RCS 加密，再更改协议。"
+                                } else { kind = item }
+                            }
+                        }
+                    }.accessibilityLabel("消息协议，" + kind)
+                }
+                Spacer()
+            }
+            if case .iPhone = sender {
+                if kind != "SMS" || attachment != nil {
+                    IPhoneMessageAttachmentPicker(attachment: $attachment, error: $sendError)
+                }
+                if kind == "RCS", #available(iOS 26.5, *) {
+                    Toggle("端到端加密", isOn: $encrypted).font(.caption)
+                }
+                if kind == "RCS" && attachment != nil && !content.isEmpty {
+                    Text("RCS 附件需要与文字分开发送。").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }.font(.subheadline).padding(.horizontal, 16).padding(.vertical, 8).disabled(sending)
     }
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
                 recipientBar
-                HStack(spacing: 8) {
-                    Text("发件线路：").font(.subheadline).foregroundStyle(.secondary)
-                    SMSAccountPicker(recipient: recipient).disabled(sending)
-                    Spacer()
-                }
-                .padding(.horizontal, 16).padding(.vertical, 8)
+                senderControls
 
                 if !suggestions.isEmpty {
                     Divider()
@@ -1725,6 +1892,11 @@ private struct MessageComposer: View {
                         .disabled(!canSend)
                 }
             }
+            .onAppear { carrier.refresh(); chooseInitialSender() }
+            .onChange(of: carrier.lines) { _ in chooseInitialSender() }
+            .alert("发送消息", isPresented: Binding(get: { sendError != nil }, set: { if !$0 { sendError = nil } })) {
+                Button("好") { sendError = nil }
+            } message: { Text(sendError ?? "") }
             .task { await model.contacts.loadIfAuthorized(force: true) }
             .sheet(isPresented: $showingContacts) {
                 MessageContactPicker { phone in
@@ -1834,9 +2006,6 @@ private struct MessageComposer: View {
                 .accessibilityLabel(L10n.t("发送"))
             }
 
-            Text(L10n.t("短信将通过 4G 模块发送"))
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -1844,11 +2013,29 @@ private struct MessageComposer: View {
     }
 
     private func sendNow() {
-        guard canSend else { return }
+        guard canSend, let sender else { return }
+        let address = recipient.trimmingCharacters(in: .whitespacesAndNewlines)
+        let draft = content
+        let protocolKind = kind
+        let files = attachment.map { [$0] } ?? []
+        let useEncryption = encrypted
         sending = true
-        Task {
-            if await model.sendSMS(to: recipient, content: content) { dismiss() }
-            sending = false
+        Task { @MainActor in
+            defer { sending = false }
+            switch sender {
+            case .android:
+                if await model.sendSMS(to: address, content: draft) { dismiss() }
+                else {
+                    sendError = model.errorMessage ?? "安卓短信未确认发送，请检查号码、内容和网关状态。"
+                    model.errorMessage = nil
+                }
+            case .iPhone(let id):
+                do {
+                    try await carrier.send(draft, to: address, lineID: id, kind: protocolKind,
+                                           attachments: files, encrypted: useEncryption)
+                    dismiss()
+                } catch { sendError = error.localizedDescription }
+            }
         }
     }
 }
@@ -2840,7 +3027,7 @@ struct CompactSIMSelectionPanel: View {
     var title: String? = nil
     let select: (AndroidSIMSlot) -> Void
 
-    static func title(for slot: AndroidSIMSlot) -> String {
+    nonisolated static func title(for slot: AndroidSIMSlot) -> String {
         let card = slot.slotIndex.map { "SIM \($0 + 1)" } ?? slot.label
         if let carrier = slot.carrierName?.trimmingCharacters(in: .whitespacesAndNewlines), !carrier.isEmpty {
             return "\(card) · \(carrier)"

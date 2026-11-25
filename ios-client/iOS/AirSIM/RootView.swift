@@ -46,7 +46,7 @@ enum SystemCommunicationURL {
         return dialableNumber(from: value)
     }
 
-    private static func dialableNumber(from value: String) -> String? {
+    static func dialableNumber(from value: String) -> String? {
         let numberCharacters = CharacterSet(charactersIn: "0123456789+*#")
         let formatting = CharacterSet.whitespaces.union(CharacterSet(charactersIn: "-()."))
         guard value.unicodeScalars.allSatisfy({ numberCharacters.contains($0) || formatting.contains($0) })
@@ -109,7 +109,10 @@ struct RootView: View {
     @State private var appUpdatePresentation: AppUpdatePresentation?
     @AppStorage("airsim.selected-tab") private var selectedTabRawValue = PhoneTab.dial.rawValue
     @State private var collapsedCallID: String?
-    @State private var callbackSIMRequest: CallbackSIMDialRequest?
+    @State private var dialLineRequest: DialLineRequest?
+    @State private var selectedDialLine: DialLineID?
+    @State private var iPhoneLines: [IPhoneCellularLine] = []
+    @State private var submittingDial = false
     @State private var pendingSMSRecipient: String?
     @State private var messageListState = SMSConversationListState()
     @State private var conversationSender: String?
@@ -133,7 +136,7 @@ struct RootView: View {
     var body: some View {
         ZStack(alignment: .topTrailing) {
                 TabView(selection: selectedTabBinding) {
-                    DialPadView()
+                    dialPad
                         .tag(PhoneTab.dial)
                         .tabItem { Label { Text(L10n.t(PhoneTab.dial.tabTitle)) } icon: {
                             Image(uiImage: PhoneTab.dial.tabImage)
@@ -217,9 +220,10 @@ struct RootView: View {
             }
         }
         .background(PhoneBackdrop())
-        .modifier(CallbackSIMDialChoice(request: $callbackSIMRequest, choose: confirmCallbackSIM))
+        .modifier(IPhoneCarrierPresentation())
+        .modifier(DialLinePicker(request: $dialLineRequest, selected: activeDialLine?.id, choose: selectDialLine))
         .onChange(of: model.callLifecycleSnapshot.state.representsCall) { inCall in
-            if inCall { callbackSIMRequest = nil }
+            if inCall { dialLineRequest = nil }
         }
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: model.inAppPresentedCall?.id)
         .preferredColorScheme(settings.appearance.colorScheme)
@@ -273,6 +277,7 @@ struct RootView: View {
         }
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
+            iPhoneLines = IPhoneCellularDialer.availableLines
             presentAppUpdateIfIdle()
             if firstConnectionComplete && appUpdateCallIdle {
                 _ = await appUpdates.check(manual: false)
@@ -368,32 +373,111 @@ struct RootView: View {
         nonmutating set { selectedTabRawValue = newValue.rawValue }
     }
 
+    private var dialAgentID: String? {
+        AndroidAgentBindingPreference.selected() ?? model.currentAndroidAgent?.id
+    }
+
+    private var dialIdle: Bool {
+        appUpdateCallIdle && !model.callLifecycleSnapshot.state.representsCall && !submittingDial
+    }
+
+    private func dialLines(_ local: [IPhoneCellularLine]) -> [DialLineChoice] {
+        let agent = dialAgentID
+        return DialLineChoice.roster(agentID: agent, slots: agent.map { model.simSlots(for: $0) } ?? [],
+            hasAndroid: agent != nil || model.canStartOutgoingCommand, local: local,
+            supportsSystem: IPhoneCellularDialer.supportsSystemFallback)
+    }
+
+    private var activeDialLine: DialLineChoice? {
+        let choices = dialLines(iPhoneLines)
+        if let selectedDialLine { return choices.first { $0.id == selectedDialLine } }
+        if let agent = dialAgentID, let saved = model.selectedSIMSlotID(for: agent),
+           let line = choices.first(where: { $0.id == .android(agentID: agent, slotID: saved) }) { return line }
+        if let android = choices.first(where: { $0.id.isAndroid }) { return android }
+        if iPhoneLines.count > 1, let system = choices.first(where: { $0.id == .system }) { return system }
+        return choices.first
+    }
+
+    private var dialPad: some View {
+        let line = activeDialLine
+        return DialPadView(lineTitle: line?.title ?? "选择通话线路",
+            canDial: dialIdle && line.map { !$0.id.isAndroid || (!model.isBusy && model.canStartOutgoingCommand) } == true,
+            canChooseLine: dialIdle, chooseLine: { presentDialLines() },
+            chooseAndroid: { agentID in
+                model.bindAndroidAgent(agentID)
+                selectedDialLine = nil
+            },
+            submit: { if let line { submitDial(using: line.id) } })
+    }
+
+    private func presentDialLines(onlyIfMultiple: Bool = false) {
+        guard dialIdle else { return }
+        iPhoneLines = IPhoneCellularDialer.availableLines
+        let choices = dialLines(iPhoneLines)
+        guard !choices.isEmpty else {
+            if !onlyIfMultiple { model.errorMessage = "当前没有可用的通话线路" }
+            return
+        }
+        if !onlyIfMultiple || choices.count > 1 {
+            dialLineRequest = DialLineRequest(number: model.numberInput, choices: choices)
+        }
+    }
+
     private func prefillDialPad(_ number: String) {
         showingConversation = false
         model.numberInput = number
         selectedTab = .dial
-        callbackSIMRequest = nil
-        guard appUpdateCallIdle, !model.callLifecycleSnapshot.state.representsCall else { return }
-        let agentID = AndroidAgentBindingPreference.selected() ?? model.currentAndroidAgent?.id
-        if let agentID {
-            let slots = model.simSlots(for: agentID)
-            if slots.count > 1 {
-                callbackSIMRequest = .init(agentID: agentID, number: number, slots: slots)
-            }
-        }
+        dialLineRequest = nil
+        presentDialLines(onlyIfMultiple: true)
     }
 
-    private func confirmCallbackSIM(_ request: CallbackSIMDialRequest, _ slot: AndroidSIMSlot) {
-        let agentID = AndroidAgentBindingPreference.selected() ?? model.currentAndroidAgent?.id
-        guard model.numberInput == request.number,
-              request.permits(agentID: agentID, liveSlots: agentID.map { model.simSlots(for: $0) } ?? [],
-                              slotID: slot.id, callInProgress: model.callLifecycleSnapshot.state.representsCall || model.pendingOutgoingCall != nil) else {
-            callbackSIMRequest = nil
-            model.errorMessage = "设备或 SIM 卡已变化，请重新选择后拨号"
+    private func selectDialLine(_ request: DialLineRequest, _ line: DialLineChoice) {
+        // A stale popover must never select a route for a newer external dial request.
+        guard dialLineRequest?.id == request.id else { return }
+        dialLineRequest = nil
+        iPhoneLines = IPhoneCellularDialer.availableLines
+        guard request.permits(line.id, number: model.numberInput, live: dialLines(iPhoneLines), idle: dialIdle) else {
+            model.errorMessage = "号码或通话线路已变化，请重新选择"
             return
         }
-        model.selectSIMSlot(slot.id, for: request.agentID)
-        callbackSIMRequest = nil
+        if case let .android(agent?, slot?) = line.id { model.selectSIMSlot(slot, for: agent) }
+        selectedDialLine = line.id
+    }
+
+    private func submitDial(using route: DialLineID) {
+        guard dialIdle, !model.numberInput.isEmpty else { return }
+        let number = model.numberInput
+        iPhoneLines = IPhoneCellularDialer.availableLines
+        guard dialLines(iPhoneLines).contains(where: { $0.id == route }) else {
+            model.errorMessage = "所选通话线路已不可用，请重新选择"
+            return
+        }
+        submittingDial = true
+        Task { @MainActor in
+            defer { submittingDial = false }
+            guard model.numberInput == number, appUpdateCallIdle,
+                  !model.callLifecycleSnapshot.state.representsCall else { return }
+            do {
+                switch route {
+                case let .android(agent, slot):
+                    guard !model.isBusy, model.canStartOutgoingCommand, agent == dialAgentID,
+                          dialLines(iPhoneLines).contains(where: { $0.id == route }) else {
+                        model.errorMessage = "安卓通话线路已变化或离线，请重新选择"
+                        return
+                    }
+                    if let agent, let slot { model.selectSIMSlot(slot, for: agent) }
+                    await model.dial()
+                    return
+                case .iPhone(let id):
+                    try await IPhoneCellularDialer.dial(number, using: id)
+                case .system:
+                    try await IPhoneCellularDialer.dialWithSystem(number)
+                }
+                if model.numberInput == number { model.numberInput = "" }
+            } catch {
+                model.errorMessage = error.localizedDescription
+            }
+        }
     }
 
     private func handleSystemCallActivity(_ activity: NSUserActivity) {
@@ -722,30 +806,80 @@ private struct AdaptiveMessagesView: View {
 }
 
 
-/// UI-only callback intent. The existing model/router remains the dial owner.
-struct CallbackSIMDialRequest: Identifiable {
-    let id = UUID()
-    let agentID: String
-    let number: String
-    let slots: [AndroidSIMSlot]
-    func permits(agentID current: String?, liveSlots: [AndroidSIMSlot], slotID: String, callInProgress: Bool) -> Bool {
-        !callInProgress && current == agentID && slots.contains { $0.id == slotID }
-            && liveSlots.contains { $0.id == slotID }
+enum DialLineID: Hashable {
+    case android(agentID: String?, slotID: String?)
+    case iPhone(UUID)
+    case system
+
+    var isAndroid: Bool {
+        if case .android = self { return true }
+        return false
     }
 }
 
-private struct CallbackSIMDialChoice: ViewModifier {
-    @EnvironmentObject private var model: AppModel
-    @Binding var request: CallbackSIMDialRequest?
-    let choose: (CallbackSIMDialRequest, AndroidSIMSlot) -> Void
+struct DialLineChoice: Identifiable, Equatable {
+    let id: DialLineID
+    let title: String
+
+    static func roster(agentID: String?, slots: [AndroidSIMSlot], hasAndroid: Bool,
+                       local: [IPhoneCellularLine], supportsSystem: Bool) -> [Self] {
+        var choices: [Self] = []
+        if let agentID, !slots.isEmpty {
+            choices = slots.map { slot in
+                Self(id: .android(agentID: agentID, slotID: slot.id),
+                     title: "安卓 · \(CompactSIMSelectionPanel.title(for: slot))")
+            }
+        } else if hasAndroid {
+            choices.append(Self(id: .android(agentID: agentID, slotID: nil), title: "安卓默认线路"))
+        }
+        choices += local.map { Self(id: .iPhone($0.id), title: "iPhone · \($0.label)") }
+        if supportsSystem { choices.append(Self(id: .system, title: "iPhone · 系统选线")) }
+        return choices
+    }
+}
+
+struct DialLineRequest: Identifiable {
+    let id = UUID()
+    let number: String
+    let choices: [DialLineChoice]
+
+    func permits(_ route: DialLineID, number currentNumber: String, live: [DialLineChoice], idle: Bool) -> Bool {
+        idle && number == currentNumber && choices.contains { $0.id == route } && live.contains { $0.id == route }
+    }
+}
+
+private struct DialLinePicker: ViewModifier {
+    @Binding var request: DialLineRequest?
+    let selected: DialLineID?
+    let choose: (DialLineRequest, DialLineChoice) -> Void
+
     func body(content: Content) -> some View {
         content.overlay {
             Color.clear.frame(width: 1, height: 1)
                 .popover(item: $request) { captured in
-                    CompactSIMSelectionPanel(slots: captured.slots,
-                        selectedID: model.selectedSIMSlotID(for: captured.agentID), title: "拨号用卡") { slot in
-                        choose(captured, slot)
-                    }.compactSIMPopoverPresentation()
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text("拨号用卡").font(.headline).padding(.bottom, 6)
+                        ForEach(captured.choices) { line in
+                            Button {
+                                choose(captured, line)
+                            } label: {
+                                HStack {
+                                    Image(systemName: line.id.isAndroid ? "simcard" : "iphone")
+                                    Text(line.title).multilineTextAlignment(.leading)
+                                    Spacer(minLength: 8)
+                                    if selected == line.id { Image(systemName: "checkmark") }
+                                }
+                                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityAddTraits(selected == line.id ? .isSelected : [])
+                        }
+                    }
+                    .padding(16)
+                    .frame(idealWidth: 280)
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+                    .compactSIMPopoverPresentation()
                 }
         }
     }
