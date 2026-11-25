@@ -52,4 +52,4 @@ sh iOS/scripts/check-default-calling-signature.sh --full "/path/to/AirSIM-195-si
 
 在自己的电脑上准备已导出、解密的 `sms.db`、`CallHistory.storedata` 或其中一个。用随附的 Python 工具生成本地 JSON，传到 iPhone 的「文件」，在 AirSIM「短信 → iPhone 本机」选择历史导入并确认。工具支持显式选择同一快照的 WAL，以及按日期分包。重复导入同一来源时保留一份记录。[工具说明与示例](tools/README.md)
 
-导入的消息用于本地只读查看，包含数据库中可解析的 iMessage 文本。旧消息附件显示占位，原始媒体保留在用户的备份中。系统默认信息入口用于预填地址，本机实时收发支持的是运营商可用的 SMS、MMS 和 RCS。[Apple 默认信息 App](https://developer.apple.com/documentation/messages/preparing-your-app-to-be-the-default-messaging-app) · [Apple 运营商消息接口](https://developer.apple.com/documentation/telephonymessagingkit)
+导入的消息用于本地只读查看，包含数据库中可解析的 iMessage 文本。若要查看旧彩信和 iMessage 附件，在导出时通过 `--attachments-dir` 选择同一快照的附件目录。每个文件最多 32 MB，单包最多 128 MB。缺失文件保留占位，之后补齐附件再导入时会并入原消息。系统默认信息入口用于预填地址，本机实时收发支持的是运营商可用的 SMS、MMS 和 RCS。[Apple 默认信息 App](https://developer.apple.com/documentation/messages/preparing-your-app-to-be-the-default-messaging-app) · [Apple 运营商消息接口](https://developer.apple.com/documentation/telephonymessagingkit)
