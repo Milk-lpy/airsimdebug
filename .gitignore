@@ -1,5 +1,9 @@
 *.p8
 *.p12
+*.pfx
+*.key
+*.pem
+*.csr
 *.cer
 *.mobileprovision
 .env
