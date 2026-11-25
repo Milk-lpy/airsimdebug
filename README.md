@@ -5,9 +5,9 @@
 | 平台 | 版本 | 源码与说明 | 安装包 |
 | --- | --- | --- | --- |
 | 安卓 Standalone | 0.9.8.27-home.12（153） | [安卓源码、安装与构建](android-client/) | [下载签名 APK](https://raw.githubusercontent.com/Milk-lpy/airsimdebug/main/binaries/android/AirSIM-Android-153.apk) |
-| iPhone 与 Apple Watch | 0.9.9（194），APNs Sandbox | [iOS 源码](ios-client/iOS/) · [编译、打包与签名](ios-client/BUILD-194.md) | 由构建流程生成完整未签名 IPA，成功后发布到 `binaries/ios/` |
+| iPhone 与 Apple Watch | 0.9.9（194），APNs Sandbox | [iOS 源码](ios-client/iOS/) · [编译、打包与签名](ios-client/BUILD-194.md) | [下载完整未签名 IPA](https://raw.githubusercontent.com/Milk-lpy/airsimdebug/main/binaries/ios/AirSIM-iOS-0.9.9-build194-Sandbox-full-unsigned.ipa) · [SHA-256](binaries/ios/AirSIM-iOS-0.9.9-build194-Sandbox-full-unsigned.ipa.sha256) |
 
-安卓包支持 Android 10 及以上，沿用家庭版签名。通用版使用系统信任的 HTTPS 证书；使用专用 CA 的家庭网关请参考安卓构建说明。APK SHA-256 为 `3eb09f284b3755cb941c804a7359377ceb29c657eb3f395ebee0839866fc485a`。
+安卓包支持 Android 10 及以上，沿用家庭版签名。通用版使用系统信任的 HTTPS 证书。家庭网关使用专用 CA 时，请参考安卓构建说明。APK SHA-256 为 `3eb09f284b3755cb941c804a7359377ceb29c657eb3f395ebee0839866fc485a`。
 
 iOS 完整包包含 iPhone App、通知服务扩展、Live Activity 和 Watch App。安装需要为各目标重新签名。自建服务见 [AirSIM Relay](https://github.com/Milk-lpy/airsim-relay)。客户端沿用 [AirSIM 上游](https://github.com/kai-wu-cortex/AirSIM) 的 PolyForm Noncommercial 1.0.0 许可，源码目录内附许可、署名和第三方声明。
 
