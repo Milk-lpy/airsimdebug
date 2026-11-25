@@ -1,0 +1,599 @@
+package com.airsim.phonecontrol;
+
+import android.app.role.RoleManager;
+import android.content.Context;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.time.Instant;
+import java.util.LinkedHashMap;
+import java.util.Locale;
+import java.util.Map;
+import java.util.UUID;
+
+/** In-process replacement for the HTTP API previously hosted by the AVF Agent. */
+final class StandaloneAgentGateway {
+    private static volatile StandaloneAgentGateway instance;
+
+    static StandaloneAgentGateway get(Context context) {
+        StandaloneAgentGateway value = instance;
+        if (value == null) {
+            synchronized (StandaloneAgentGateway.class) {
+                value = instance;
+                if (value == null) instance = value = new StandaloneAgentGateway(context);
+            }
+        }
+        return value;
+    }
+
+    private final Context context;
+    private final StandaloneAgentStore store;
+    private final StandaloneSMSStore smsStore;
+    private final DurableCommandReceipts receipts;
+    private final Object callsLock = new Object();
+    private final Object commandsLock = new Object();
+    private final StandaloneLongPoll callEvents = new StandaloneLongPoll();
+    private final StandaloneLongPoll agentEvents = new StandaloneLongPoll();
+    private volatile long simRevision;
+    private final Map<String, String> commandResults = new LinkedHashMap<>();
+    private final Map<String, AnswerAttempt> answerAttempts = new LinkedHashMap<>();
+
+    private static final class AnswerAttempt {
+        final String identity;
+        Instant expiresAt;
+        String result;
+        boolean confirmed;
+        AnswerAttempt(String identity) { this.identity = identity; }
+    }
+    private JSONObject activeCall;
+    private final Map<String, JSONObject> callsByAndroidID = new LinkedHashMap<>();
+    private final JSONArray callHistory;
+    private final android.content.SharedPreferences historyPreferences;
+
+
+    private StandaloneAgentGateway(Context context) {
+        this.context = context.getApplicationContext();
+        store = new StandaloneAgentStore(context);
+        smsStore = new StandaloneSMSStore(context);
+        historyPreferences = context.getSharedPreferences("standalone_call_history", Context.MODE_PRIVATE);
+        JSONArray history;
+        try { history = new JSONArray(historyPreferences.getString("pending", "[]")); }
+        catch (org.json.JSONException invalid) {
+            BridgeLog.error("standalone_call_history_invalid", invalid);
+            history = new JSONArray();
+        }
+        callHistory = history;
+        receipts = new DurableCommandReceipts(context.getSharedPreferences("cloud_command_receipts", Context.MODE_PRIVATE));
+    }
+
+    String health() throws Exception {
+        return new JSONObject().put("ok", true).put("product", "airsim")
+                .put("version", "standalone-0.1.0").put("runtime_profile", "android-standalone")
+                .put("sim_slots", SimSlotJson.slots(context))
+                .toString();
+    }
+
+    String status() throws Exception {
+        return new JSONObject().put("ok", true).put("configured", store.configured())
+                .put("runtime_profile", "android-standalone").put("pending_commands", 0)
+                .put("last_seen", store.lastSeen() == 0 ? "" : Instant.ofEpochMilli(store.lastSeen()).toString())
+                .put("transport", "in_process").toString();
+    }
+
+    String pushStatus() throws Exception { return store.pushStatus().toString(); }
+
+    String registrationSnapshot() { JSONObject value = store.storedRegistration(); return value == null ? "" : value.toString(); }
+    void restoreRegistrationSnapshot(String snapshot) throws Exception { store.restoreSnapshot(snapshot); }
+    void discardCloudBacklog() throws Exception { smsStore.discardCloudBacklog(); }
+
+    String debugSnapshot() throws Exception {
+        return new JSONObject().put("events", new JSONArray()).put("runtime_profile", "android-standalone")
+                .put("log_available_in_app", true).toString();
+    }
+
+    String feedbackSnapshot() throws Exception {
+        String log = BridgeLog.read();
+        return new JSONObject()
+                .put("runtime_profile", "android-standalone")
+                .put("bridge_log", log)
+                .put("manufacturer", android.os.Build.MANUFACTURER)
+                .put("model", android.os.Build.MODEL)
+                .put("sdk", android.os.Build.VERSION.SDK_INT)
+                .put("app_version", AppInformation.version(context))
+                .put("audio", new JSONObject()
+                        .put("telecom_state", CallRepository.diagnosticState())
+                        .put("pcm_client_closed", log.contains("pcm_event=client_closed"))
+                        .put("pcm_health", latestPcmHealth(log)))
+                .toString();
+    }
+
+    private JSONObject audioHostConfig() throws Exception {
+        ShizukuBridgeManager bridge = ShizukuBridgeManager.get(context);
+        bridge.refreshBridgeStatus();
+        boolean running = bridge.bridgeRunning();
+        boolean mediaReady = RemoteAudioSessionRegistry.active();
+        int rate = RemoteAudioSessionRegistry.vowlanSampleRate();
+        JSONObject config = new JSONObject().put("transport", "tcp_pcm_s16le").put("host", "127.0.0.1")
+                // Required by the existing iOS diagnostics decoder. This TCP bridge has no USB device.
+                .put("vendor_id", 0).put("product_id", 0).put("location_id", 0)
+                .put("port", 7580).put("channels", 1).put("route_running", running)
+                .put("route_session_ready", mediaReady).put("route_ready", mediaReady);
+        if (mediaReady) config.put("route_listening", true);
+        if (rate > 0) config.put("sample_rate", rate);
+        return config;
+    }
+
+    private static String latestPcmHealth(String log) {
+        String latest = "";
+        for (String line : log.split("\n")) {
+            if (line.contains("pcm_health")) latest = line;
+        }
+        return latest.length() > 1200 ? latest.substring(0, 1200) : latest;
+    }
+
+    String registerPairing(String registrationJSON) throws Exception {
+        return registrationSaved(store.savePairing(registrationJSON));
+    }
+
+    private String registrationSaved(JSONObject registration) throws Exception {
+        StandaloneAgentService.start(context);
+        if (registration.optBoolean("local_mode", false)) {
+            BridgeLog.info("standalone_local_pairing_saved");
+            return new JSONObject().put("configured", true).put("local_mode", true).toString();
+        }
+        String deviceID = registration.getString("device_id");
+        String hint = deviceID.length() <= 8 ? deviceID : "…" + deviceID.substring(deviceID.length() - 8);
+        BridgeLog.info("standalone_pairing_saved device_id_hint=" + DebugRedactor.safeIdentifier(hint));
+        return new JSONObject().put("configured", true).put("device_id_hint", hint).toString();
+    }
+
+    void sendCallEvent(String json) throws Exception {
+        JSONObject event = new JSONObject(json);
+        NotificationForwarder.handle(context, event);
+        applyCallEvent(event);
+        if (store.configured() && store.cloudEnabled()) {
+            StandaloneAgentService.enqueueCallEvent(context, event.toString());
+        }
+    }
+
+    void sendSMSEvent(String json) throws Exception {
+        JSONObject event = new JSONObject(json);
+        JSONObject registration = store.registration();
+        String legacyID = event.getString("delivery_id");
+        String slot = event.optString("sim_slot", "");
+        if (!slot.isEmpty() && legacyID.startsWith("android-sms-")) {
+            event.put("delivery_id", SMSDeliveryIdentity.forSlot(legacyID, slot));
+        }
+        final boolean blocked = registration != null && SMSNotificationFilter.suppress(registration, event);
+        if (blocked) event.put("android_filtered", true);
+        if (smsStore.addForRegistration(event, registration, legacyID)) {
+            if (!blocked) NotificationForwarder.handle(context, event);
+            agentEvents.advance();
+            if (!blocked && store.cloudEnabled()) StandaloneAgentService.start(context);
+        }
+    }
+
+    AgentClient.ForwardResponse forward(String method, String pathAndQuery, String body) throws Exception {
+        int query = pathAndQuery.indexOf('?');
+        String path = query < 0 ? pathAndQuery : pathAndQuery.substring(0, query);
+        if ("GET".equalsIgnoreCase(method)) {
+            return switch (path) {
+                case "/api/health" -> ok(health());
+                case "/api/android/status", "/api/status" -> ok(status());
+                case "/api/push/status" -> ok(pushStatus());
+                case "/api/debug" -> ok(debugSnapshot());
+                case "/api/feedback" -> ok(feedbackSnapshot());
+                case "/api/calls/status" -> ok(callSnapshot().toString());
+                case "/api/calls/events" -> waitForCallEvent(pathAndQuery);
+                case "/api/events" -> waitForAgentEvent(pathAndQuery);
+                case "/api/sms" -> ok(smsStore.localMessages().toString());
+                case "/api/sms/status" -> ok(new JSONObject().put("auto_cleanup_me", true)
+                        .put("count", smsStore.pendingCount()).put("last_poll_error", "").toString());
+                case "/api/calls/audio/host/config" -> ok(audioHostConfig().toString());
+                default -> error(404, "not_found");
+            };
+        }
+        if (!"POST".equalsIgnoreCase(method)) return error(405, "method_not_allowed");
+        JSONObject input = body == null || body.isBlank() ? new JSONObject() : new JSONObject(body);
+        return switch (path) {
+            case "/api/push/register" -> {
+                try { yield ok(registrationSaved(store.refreshRegistration(input.toString()))); }
+                catch (StandaloneAgentStore.PairingRequired conflict) { yield error(409, conflict.getMessage()); }
+            }
+            case "/api/push/mode" -> ok(store.setCloudEnabled(
+                    input.optBoolean("enabled", false)).toString());
+            case "/api/calls/resolve" -> {
+                // This new endpoint requires the complete push identity. Do not
+                // inherit the legacy cloud-command default generation of 1.
+                long requestedGeneration;
+                try { requestedGeneration = Long.parseLong(input.optString("generation", "")); }
+                catch (NumberFormatException invalid) { yield error(409, "cloud_call_identity_mismatch"); }
+                if (requestedGeneration <= 0) yield error(409, "cloud_call_identity_mismatch");
+                String resolved = StandaloneCloudMediaManager.get(context).androidCallIDFor(input);
+                synchronized (callsLock) {
+                    JSONObject target = callsByAndroidID.get(resolved);
+                    if (target == null && activeCall != null && resolved.equals(activeCall.optString("android_id"))) target = activeCall;
+                    if (resolved.isEmpty() || target == null) yield error(409, "cloud_call_identity_mismatch");
+                    yield ok(callSnapshot().put("active", target).toString());
+                }
+            }
+            case "/api/calls/dial" -> command("dial", "", input.optString("number", ""), "",
+                    input.optString("sim_account", ""));
+            case "/api/calls/answer" -> command("answer", localCallTarget("answer", input), "", "");
+            case "/api/calls/reject" -> command("reject", localCallTarget("reject", input), "", "");
+            case "/api/calls/hangup" -> command("end", localCallTarget("end", input), "", "");
+            case "/api/calls/dtmf" -> command("dtmf", localCallTarget("dtmf", input), input.optString("digit", ""), "");
+            case "/api/sms/send" -> command("send_sms", "", input.optString("phone", ""),
+                    input.optString("message", ""), input.optString("sim_account", ""));
+            case "/api/calls/history/ack" -> {
+                JSONArray ids = input.optJSONArray("ids") == null ? new JSONArray() : input.getJSONArray("ids");
+                synchronized (callsLock) {
+                    for (int index = callHistory.length() - 1; index >= 0; index--) {
+                        JSONObject record = callHistory.optJSONObject(index);
+                        if (record == null) continue;
+                        for (int id = 0; id < ids.length(); id++) {
+                            String value = ids.optString(id, "");
+                            if (!value.isEmpty() && (value.equals(record.optString("id"))
+                                    || value.equals(record.optString("android_id"))
+                                    || value.equals(record.optString("backend_id")))) {
+                                callHistory.remove(index);
+                                break;
+                            }
+                        }
+                    }
+                    saveCallHistory();
+                }
+                yield ok("{\"accepted\":true}");
+            }
+            case "/api/calls/audio/host/warmup" -> {
+                ShizukuBridgeManager.get(context).ensureStarted();
+                yield ok("{\"warming\":true}");
+            }
+            case "/api/calls/audio/host/register" -> {
+                boolean enabled = input.optBoolean("enabled", false);
+                if (enabled) ShizukuBridgeManager.get(context).ensureStarted();
+                yield ok(new JSONObject().put("enabled", enabled)
+                        .put("route_session_ready", RemoteAudioSessionRegistry.active()).toString());
+            }
+            // The paired iPhone controls its own PCM microphone. Android does not apply a global mic mute here.
+            case "/api/calls/audio/mute" -> error(501, "mute_on_media_source");
+            case "/api/sms/ack" -> {
+                smsStore.acknowledge(input.optJSONArray("ids") == null ? new JSONArray() : input.getJSONArray("ids"));
+                yield ok("{\"accepted\":true}");
+            }
+            case "/api/sms/refresh" -> ok("{\"accepted\":true}");
+            default -> error(404, "not_found");
+        };
+    }
+
+    synchronized void simSlotsChanged() {
+        simRevision++;
+        agentEvents.advance();
+    }
+
+    synchronized JSONObject executeCloudCommand(JSONObject command) throws Exception {
+        return executeCloudCommand(command,()->true);
+    }
+
+    synchronized JSONObject executeCloudCommand(JSONObject command, java.util.function.BooleanSupplier stillCurrent) throws Exception {
+        RelayEgressGate.Lease lease;
+        try { lease = RelayEgressGate.shared.acquire(() -> {}); }
+        catch (java.io.IOException denied) {
+            return new JSONObject().put("command_id", command.optString("command_id", ""))
+                    .put("status", "failed").put("error", "pure_local_relay_disabled");
+        }
+        // Track the action as well as its HTTP/socket: an already dispatched operation
+        // must finish before Android can acknowledge that the old generation drained.
+        try (lease) {
+            return executeAdmittedCloudCommand(command, () -> lease.isCurrent() && stillCurrent.getAsBoolean());
+        }
+    }
+
+    private JSONObject executeAdmittedCloudCommand(JSONObject command, java.util.function.BooleanSupplier stillCurrent) throws Exception {
+        String commandID = command.optString("command_id", "");
+        if (!stillCurrent.getAsBoolean()) return new JSONObject().put("command_id",commandID)
+                .put("status","failed").put("error","command_configuration_changed");
+        String commandKey = commandID.trim().toLowerCase(Locale.ROOT);
+        if ("call_control".equals(command.optString("type")) && "answer".equals(command.optString("action"))) {
+            return executeCloudAnswer(command, commandKey, stillCurrent);
+        }
+        if (answerAttempts.containsKey(commandKey)) return answerFailure(commandID, "command_identity_mismatch");
+        if (!commandKey.isEmpty()) {
+            synchronized (commandsLock) {
+                String cached = commandResults.get(commandKey);
+                if (cached != null) return new JSONObject(cached);
+            }
+        }
+        if (!commandID.matches("[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,36}")) {
+            return new JSONObject().put("command_id", commandID).put("status", "failed")
+                    .put("error", "云端命令 ID 无效");
+        }
+        String expires = command.optString("expires_at", "");
+        if (!expires.isEmpty()) {
+            try {
+                if (Instant.now().isAfter(Instant.parse(expires))) {
+                    return rememberCommand(commandKey, new JSONObject().put("command_id", commandID)
+                            .put("status", "failed").put("error", "云端命令已过期"));
+                }
+            } catch (Exception invalidExpiry) {
+                return rememberCommand(commandKey, new JSONObject().put("command_id", commandID)
+                        .put("status", "failed").put("error", "云端命令有效期无效"));
+            }
+        }
+        String type = command.optString("type", "");
+        String action = switch (type) {
+            case "dial" -> "dial";
+            case "send_sms" -> "send_sms";
+            case "dtmf" -> "dtmf";
+            case "call_control" -> "rescue_hangup".equals(command.optString("action"))
+                    ? "end" : command.optString("action", "");
+            default -> "";
+        };
+        String callID = CloudCallTarget.requiresIdentity(type)
+                ? StandaloneCloudMediaManager.get(context).androidCallIDFor(command.optJSONObject("call"))
+                : "dial".equals(action) || "send_sms".equals(action)
+                    ? "" : CallRepository.idForAction(action);
+        if (CloudCallTarget.requiresIdentity(type) && callID.isBlank()) {
+            return rememberCommand(commandKey,new JSONObject().put("command_id",commandID)
+                    .put("status","failed").put("error","call_mismatch"));
+        }
+        AgentCommand local = new AgentCommand(commandID, action, callID,
+                command.optString("number", ""), command.optString("message", ""),
+                command.optString("sim_account", ""));
+        var outgoing = "dial".equals(action) ? CallRepository.observeOutgoing(command.optString("number", "")) : null;
+        boolean handedToMedia = false;
+        try {
+            if (!stillCurrent.getAsBoolean()) return new JSONObject().put("command_id", commandID)
+                    .put("status", "failed").put("error", "command_configuration_changed");
+            boolean billable = "dial".equals(action) || "send_sms".equals(action);
+            if (billable) {
+                long now = System.currentTimeMillis();
+                // Current Relay expiry is 2–5 minutes. Retain legacy un-timed command IDs for a day.
+                long until = expires.isEmpty() ? now + 86_400_000L : Instant.parse(expires).toEpochMilli();
+                JSONObject previous = receipts.reserve(commandKey, action, until, now);
+                if (previous != null) return previous.put("command_id", commandID);
+                if (!stillCurrent.getAsBoolean()) return answerFailure(commandID, "command_configuration_changed");
+            }
+            AgentCommandDispatcher.Result result = execute(local);
+            JSONObject output = new JSONObject().put("command_id", commandID)
+                    .put("status", result.success() ? "completed" : "failed");
+            if (result.success()) {
+                JSONObject detail = new JSONObject();
+                if ("send_sms".equals(action)) detail.put("sent", true).put("segments", result.segments());
+                else if ("dial".equals(action)) {
+                    detail.put("dialing", true).put("android_confirmed", true);
+                    // This uncached path runs once per command. Replayed completions must not
+                    // restart media, replace its ownership observation, or resurrect ended calls.
+                    JSONObject registration = store.registration();
+                    if (registration != null && stillCurrent.getAsBoolean()) {
+                        // The received call identifiers belong to the Relay that supplied this command.
+                        StandaloneCloudMediaManager.get(context).startOutgoing(command.optJSONObject("call"), outgoing,
+                                registration.optString("relay_url"), stillCurrent);
+                        handedToMedia = true;
+                    }
+                }
+                else if ("answer".equals(action)) detail.put("answered", true).put("android_confirmed", true);
+                else if ("end".equals(action) || "reject".equals(action)) detail.put("ended", true).put("android_confirmed", true);
+                else detail.put("sent", true);
+                output.put("result", detail);
+            } else {
+                output.put("error", result.error());
+            }
+            if (billable) receipts.complete(commandKey, output);
+            return rememberCommand(commandKey, output);
+        } finally {
+            if (!handedToMedia && outgoing != null) outgoing.close();
+        }
+    }
+
+    /** Legacy wire `answer` means media preparation for an owned outgoing call. */
+    private JSONObject executeCloudAnswer(JSONObject command, String key,
+                                         java.util.function.BooleanSupplier stillCurrent) throws Exception {
+        String id = command.optString("command_id", "");
+        if (!id.matches("[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,36}")) return answerFailure(id, "invalid_command_id");
+        if (commandResults.containsKey(key)) return answerFailure(id, "command_identity_mismatch");
+        JSONObject call = command.optJSONObject("call");
+        if (call == null) return answerFailure(id, "call_mismatch");
+        String identity = new JSONArray().put(call.optString("call_id"))
+                .put(call.optString("call_uuid").toLowerCase(Locale.ROOT))
+                .put(call.optLong("generation", -1)).toString();
+        AnswerAttempt attempt = answerAttempts.get(key);
+        if (attempt != null && !attempt.identity.equals(identity)) return answerFailure(id, "command_identity_mismatch");
+        if (attempt == null) {
+            attempt = new AnswerAttempt(identity);
+            answerAttempts.put(key, attempt);
+            while (answerAttempts.size() > 128) answerAttempts.remove(answerAttempts.keySet().iterator().next());
+        }
+        // HTTP and media retries share an intent. Omitting/changing expires_at on
+        // the media frame cannot extend an expiry already supplied by Relay.
+        String expires = command.optString("expires_at", "");
+        if (!expires.isEmpty()) {
+            try {
+                Instant supplied = Instant.parse(expires);
+                if (attempt.expiresAt == null || supplied.isBefore(attempt.expiresAt)) attempt.expiresAt = supplied;
+            } catch (Exception invalid) { return answerFailure(id, "invalid_command_expiry"); }
+        }
+        // Expiry limits first execution, not restoration of an already confirmed
+        // media session (iOS reuses the answer ID for the lifetime of a call).
+        // Such replays still resolve the exact live call below and invoke no answer.
+        if (!attempt.confirmed && attempt.expiresAt != null && !Instant.now().isBefore(attempt.expiresAt))
+            return answerFailure(id, "command_expired");
+        if (!stillCurrent.getAsBoolean()) return answerFailure(id, "command_configuration_changed");
+        var target = StandaloneCloudMediaManager.get(context).cloudAnswerTarget(call);
+        if (target == null) return answerFailure(id, "call_mismatch");
+        if (target.waitingForTelecom()) return answerFailure(id, "call_not_ready");
+        int state = target.state();
+        if (state < 0 || state == android.telecom.Call.STATE_DISCONNECTING
+                || state == android.telecom.Call.STATE_DISCONNECTED) return answerFailure(id, "call_ended");
+        if (target.outgoing()) {
+            if (state != android.telecom.Call.STATE_DIALING && state != android.telecom.Call.STATE_CONNECTING
+                    && state != android.telecom.Call.STATE_SELECT_PHONE_ACCOUNT
+                    && state != android.telecom.Call.STATE_ACTIVE && state != android.telecom.Call.STATE_HOLDING)
+                return answerFailure(id, "call_not_ready");
+            // ACK only grants the existing state-gated PCM loop permission to
+            // prepare. It neither invokes Telecom.answer nor declares ACTIVE.
+            attempt.confirmed = true;
+            return new JSONObject().put("command_id", id).put("status", "completed")
+                    .put("result", new JSONObject().put("media_prepared", true).put("android_confirmed", true));
+        }
+        // A timed-out incoming answer can later be confirmed without invoking it
+        // again. Never blindly retry a Telecom side effect with an unknown result.
+        if (state == android.telecom.Call.STATE_ACTIVE || state == android.telecom.Call.STATE_HOLDING) {
+            attempt.confirmed = true;
+            attempt.result = new JSONObject().put("command_id", id).put("status", "completed")
+                    .put("result", new JSONObject().put("answered", true).put("android_confirmed", true)).toString();
+            return new JSONObject(attempt.result);
+        }
+        if (attempt.confirmed) return answerFailure(id, "call_not_ready");
+        if (attempt.result != null) return new JSONObject(attempt.result);
+        if (state != android.telecom.Call.STATE_RINGING) return answerFailure(id, "call_not_ready");
+        // Reserve before dispatch; an exception is also an unknown outcome.
+        attempt.result = answerFailure(id, "answer_result_unknown").toString();
+        AgentCommandDispatcher.Result result = execute(new AgentCommand(id, "answer", target.androidID(), "", "", ""));
+        JSONObject output = result.success()
+                ? new JSONObject().put("command_id", id).put("status", "completed")
+                    .put("result", new JSONObject().put("answered", true).put("android_confirmed", true))
+                : answerFailure(id, result.error());
+        attempt.result = output.toString();
+        attempt.confirmed = result.success();
+        return output;
+    }
+
+    private static JSONObject answerFailure(String id, String error) throws Exception {
+        return new JSONObject().put("command_id", id).put("status", "failed").put("error", error);
+    }
+
+    private JSONObject rememberCommand(String commandKey, JSONObject output) {
+        if (commandKey.isEmpty()) return output;
+        synchronized (commandsLock) {
+            commandResults.put(commandKey, output.toString());
+            while (commandResults.size() > 128) {
+                commandResults.remove(commandResults.keySet().iterator().next());
+            }
+        }
+        return output;
+    }
+
+    private AgentClient.ForwardResponse command(String action, String callID, String number, String message)
+            throws Exception {
+        return command(action, callID, number, message, "");
+    }
+
+    private AgentClient.ForwardResponse command(String action, String callID, String number, String message,
+                                                String simAccount) throws Exception {
+        String commandID = UUID.randomUUID().toString();
+        AgentCommandDispatcher.Result result = execute(new AgentCommand(
+                commandID, action, callID, number, message, simAccount));
+        if (!result.success()) return error(502, result.error());
+        JSONObject value = new JSONObject();
+        switch (action) {
+            case "dial" -> value.put("dialing", true).put("number", number).put("android_confirmed", true)
+                    .put("telecom_dial_command_id", commandID);
+            case "answer" -> value.put("answered", true);
+            case "reject" -> value.put("rejected", true);
+            case "end" -> value.put("hung_up", true);
+            case "dtmf" -> value.put("sent", true);
+            case "send_sms" -> value.put("sent", true).put("segments", result.segments());
+        }
+        return ok(value.toString());
+    }
+
+    private String localCallTarget(String action, JSONObject input) {
+        synchronized (callsLock) {
+            String requested = input.optString("call_id");
+            if (requested.isEmpty()) return CallRepository.idForAction(action);
+            for (JSONObject record : callsByAndroidID.values()) {
+                if (requested.equals(record.optString("id"))) {
+                    return CallRepository.idForPublishedAction(action, requested, requested, record.optString("android_id"));
+                }
+            }
+            return "";
+        }
+    }
+
+    private AgentCommandDispatcher.Result execute(AgentCommand command) {
+        RoleManager roles = context.getSystemService(RoleManager.class);
+        boolean dialer = roles != null && roles.isRoleHeld(RoleManager.ROLE_DIALER);
+        return AgentCommandDispatcher.execute(command, dialer,
+                value -> {
+                    CallRepository.ActionResult result = CallRepository.execute(
+                            context, value);
+                    return new AgentCommandDispatcher.Result(result.success, result.error, 0);
+                },
+                value -> SMSCommandExecutor.execute(context, value));
+    }
+
+    private void applyCallEvent(JSONObject event) throws Exception {
+        synchronized (callsLock) {
+            String state = event.optString("state", "");
+            String id = event.optString("call_id");
+            if (id.isEmpty()) return;
+            JSONObject record = callsByAndroidID.get(id);
+            String now = Instant.now().toString();
+            if ("ended".equals(state)) {
+                if (record == null) return; // Duplicate terminal callback.
+                boolean missed = event.optBoolean("missed", "incoming".equals(record.optString("direction")))
+                        && !record.has("connected_at");
+                record.put("missed", missed).put("state", "ended").put("ended_at", now).put("updated_at", now);
+                callsByAndroidID.remove(id);
+                callHistory.put(record);
+                saveCallHistory();
+                if (record == activeCall) activeCall = callsByAndroidID.values().stream().findFirst().orElse(null);
+            } else {
+                if (record == null) {
+                    record = new JSONObject().put("id", "android-" + id).put("android_id", id)
+                            .put("index", 1).put("started_at", now).put("missed", false);
+                    callsByAndroidID.put(id, record);
+                }
+                record.put("direction", event.optString("direction")).put("state", state)
+                        .put("number", event.optString("number")).put("updated_at", now);
+                if (("active".equals(state) || "held".equals(state)) && !record.has("connected_at")) {
+                    record.put("connected_at", now);
+                }
+                if (event.has("slot_index")) {
+                    record.put("slot_index", event.optInt("slot_index", -1))
+                            .put("slot_id", event.optInt("slot_id", event.optInt("slot_index", -1)));
+                }
+                if (activeCall == null || activeCall == record || "incoming".equals(state)
+                        || ("active".equals(state) && !"incoming".equals(activeCall.optString("state")))) activeCall = record;
+            }
+        }
+        callEvents.advance();
+        agentEvents.advance();
+    }
+
+    private void saveCallHistory() {
+        historyPreferences.edit().putString("pending", callHistory.toString()).apply();
+    }
+
+    private JSONObject callSnapshot() throws Exception {
+        synchronized (callsLock) {
+            return new JSONObject().put("active", activeCall == null ? JSONObject.NULL : new JSONObject(activeCall.toString()))
+                    .put("history", new JSONArray(callHistory.toString())).put("polling", false).put("event_driven", true)
+                    .put("poll_interval_s", 0).put("last_poll_error", "")
+                    .put("revision", callEvents.revision());
+        }
+    }
+
+    private AgentClient.ForwardResponse waitForCallEvent(String pathAndQuery) throws Exception {
+        StandaloneLongPoll.Request request = StandaloneLongPoll.parse(pathAndQuery, 25_000);
+        callEvents.awaitChange(request.after(), request.timeoutMillis());
+        return ok(callSnapshot().toString());
+    }
+
+    private AgentClient.ForwardResponse waitForAgentEvent(String pathAndQuery) throws Exception {
+        StandaloneLongPoll.Request request = StandaloneLongPoll.parse(pathAndQuery, 15_000);
+        agentEvents.awaitChange(request.after(), request.timeoutMillis());
+        return ok(new JSONObject().put("revision", agentEvents.revision())
+                .put("sms_revision", smsStore.revision()).put("sms_pending", smsStore.pendingCount())
+                .put("sim_revision", simRevision)
+                .put("sim_slots", SimSlotJson.slots(context))
+                .put("call", callSnapshot()).toString());
+    }
+
+    private static AgentClient.ForwardResponse ok(String body) { return new AgentClient.ForwardResponse(200, body); }
+    private static AgentClient.ForwardResponse error(int status, String message) throws Exception {
+        return new AgentClient.ForwardResponse(status, new JSONObject().put("error", message).toString());
+    }
+}
