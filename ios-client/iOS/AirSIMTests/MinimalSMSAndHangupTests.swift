@@ -97,6 +97,49 @@ final class CallbackSIMDialChoiceTests: XCTestCase {
         XCTAssertTrue(DialLineChoice.roster(agentID: nil, slots: [], hasAndroid: false, local: [], supportsSystem: false).isEmpty)
     }
 
+    func testStoredRoutesSurviveRelaunchAndMissingCardDoesNotFallBack() throws {
+        let choices = roster("A", slots: slots, local: [primary, secondary])
+        for choice in choices {
+            let saved = DialLinePreference(data: try JSONEncoder().encode(choice.id))
+            XCTAssertEqual(saved.resolve(in: choices, androidDefault: nil)?.id, choice.id)
+            let remaining = choices.filter { $0.id != choice.id }
+            XCTAssertNil(saved.resolve(in: remaining, androidDefault: remaining.first?.id))
+        }
+        let data = try JSONEncoder().encode(DialLineID.iPhone(primary.id))
+        let preference = DialLinePreference(data: data)
+        XCTAssertNil(preference.resolve(in: roster(nil, slots: [], local: []), androidDefault: nil))
+        XCTAssertEqual(preference.resolve(in: roster(nil, slots: [], local: [secondary, primary]), androidDefault: nil)?.id, .iPhone(primary.id))
+        XCTAssertNil(DialLinePreference(data: Data("invalid".utf8)).resolve(in: choices, androidDefault: nil))
+    }
+
+    func testAutomaticUsesPriorAndroidDefaultAndSystemChoiceIsSeparate() {
+        let automatic = DialLinePreference(data: Data())
+        let choices = roster("A", slots: slots, local: [primary, secondary])
+        let old = DialLineID.android(agentID: "A", slotID: slots[1].id)
+        XCTAssertEqual(automatic.resolve(in: choices, androidDefault: old)?.id, old)
+        XCTAssertEqual(automatic.resolve(in: roster(nil, slots: [], local: [primary]), androidDefault: nil)?.id, .iPhone(primary.id))
+        XCTAssertEqual(automatic.resolve(in: roster(nil, slots: [], local: [primary, secondary]), androidDefault: nil)?.id, .system)
+        XCTAssertEqual(DialLinePreference.chosen(.system).resolve(in: choices, androidDefault: old)?.id, .system)
+    }
+
+    func testNativeVoiceInventoryReportsOnlyActualServicesAndHidesIdentifiersInDiagnostics() throws {
+        let suite = "airsim.test.lines." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(try JSONEncoder().encode(DialLineID.iPhone(primary.id)), forKey: DialLinePreference.storageKey)
+        XCTAssertNotEqual(IPhoneCellularLineInventory.notQueried.summary, IPhoneCellularLineInventory.reported([]).summary)
+        let duplicateLabel = IPhoneCellularLine(id: UUID(), label: primary.label)
+        for lines in [[], [primary], [duplicateLabel, primary]] {
+            let inventory = IPhoneCellularLineInventory.reported(lines)
+            XCTAssertTrue(inventory.summary.contains("\(lines.count) 条"))
+            XCTAssertEqual(inventory.lines.map(\.id), lines.map(\.id))
+            let summary = DialLinePreference.storedSummary(in: inventory, defaults: defaults)
+            XCTAssertTrue(summary.contains(lines.isEmpty ? "未返回" : "可见"))
+            XCTAssertFalse(summary.contains(primary.id.uuidString))
+            XCTAssertFalse(summary.contains(primary.label))
+        }
+    }
+
 }
 
 final class ExternalDialHandoffTests: XCTestCase {
@@ -394,6 +437,27 @@ final class AndroidFilteredSMSHandoffTests: XCTestCase {
 }
 
 final class SystemCallHistoryTests: XCTestCase {
+
+    func testFailedQueryDoesNotReportAnEmptyHistory() {
+        let error = NSError(domain: "XPC.XPCRichError", code: 1,
+                            userInfo: [NSLocalizedDescriptionKey: "private data"])
+        let failure = SystemHistoryFailure(error)
+        XCTAssertTrue(failure.isXPC)
+        XCTAssertNil(failure.canRetry)
+        XCTAssertFalse(failure.diagnostic.contains("private data"))
+        XCTAssertFalse(SystemHistoryReadState.failed(failure).canConfirmEmpty(hasOlder: false))
+        XCTAssertFalse(SystemHistoryReadState.idle.canConfirmEmpty(hasOlder: false))
+        XCTAssertFalse(SystemHistoryReadState.loading.canConfirmEmpty(hasOlder: false))
+        XCTAssertFalse(SystemHistoryReadState.ready.canConfirmEmpty(hasOlder: true))
+        XCTAssertTrue(SystemHistoryReadState.ready.canConfirmEmpty(hasOlder: false))
+        XCTAssertTrue(SystemHistoryReadState.unsupported.canConfirmEmpty(hasOlder: false))
+    }
+
+    func testOnlyExplicitlyInterruptedCocoaConnectionQualifiesForAutomaticRetry() {
+        XCTAssertEqual(SystemHistoryFailure(CocoaError(.xpcConnectionInterrupted)).canRetry, true)
+        XCTAssertNil(SystemHistoryFailure(CocoaError(.xpcConnectionInvalid)).canRetry)
+        XCTAssertNil(SystemHistoryFailure(NSError(domain: "other", code: 1)).canRetry)
+    }
     private func entry(_ id: UUID = UUID(), at seconds: TimeInterval = 10, number: String = "5550100") -> SystemCallEntry {
         .init(id: id, date: Date(timeIntervalSince1970: seconds), direction: "incoming", status: "已接通",
               missed: false, duration: 12, participants: [.init(label: number, phone: number)])
@@ -568,5 +632,82 @@ final class IPhoneMailboxTests: XCTestCase {
         XCTAssertNotNil(box.lastError)
         XCTAssertThrowsError(try box.insert(message("must-not-replace")))
         XCTAssertEqual(try Data(contentsOf: path), original)
+    }
+}
+
+extension SystemCallHistoryTests {
+    private func signingTLV(_ tag: UInt8, _ bytes: [UInt8]) -> [UInt8] {
+        let n = bytes.count
+        if n < 128 { return [tag, UInt8(n)] + bytes }
+        if n < 256 { return [tag, 0x81, UInt8(n)] + bytes }
+        return [tag, 0x82, UInt8(n >> 8), UInt8(n & 255)] + bytes
+    }
+
+    private func signingImage(der: [UInt8]?, xml: [UInt8]? = nil) -> Data {
+        func word(_ n: Int, little: Bool = false) -> [UInt8] {
+            let big: [UInt8] = [24, 16, 8, 0].map { UInt8(truncatingIfNeeded: n >> $0) }
+            return little ? Array(big.reversed()) : big
+        }
+        var slots: [(Int, [UInt8])] = []
+        if let xml { slots.append((5, word(0xfade7171) + word(xml.count + 8) + xml)) }
+        if let der { slots.append((7, word(0xfade7172) + word(der.count + 8) + der)) }
+        let start = 12 + 8 * slots.count
+        var indices: [UInt8] = [], payload: [UInt8] = []
+        for (id, blob) in slots {
+            indices += word(id) + word(start + payload.count)
+            payload += blob
+        }
+        var signature = word(0xfade0cc0) + word(start + payload.count) + word(slots.count)
+        signature += indices + payload
+        let header = [0xfeedfacf, 0x0100000c, 0, 2, 1, 16, 0, 0].flatMap { word($0, little: true) }
+        let command = [0x1d, 16, 48, signature.count].flatMap { word($0, little: true) }
+        return Data(header + command + signature)
+    }
+
+    private func signingEntry(_ suffix: String, _ value: [UInt8]) -> [UInt8] {
+        let key = Array(("com.apple.developer." + suffix).utf8)
+        return signingTLV(0x30, signingTLV(0x0c, key) + value)
+    }
+
+    private func signingProfile(_ fields: [String: Any]) throws -> Data {
+        let plist = try PropertyListSerialization.data(fromPropertyList: ["Entitlements": fields], format: .xml, options: 0)
+        let oid: [UInt8] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 7]
+        let split = plist.count / 2
+        let chunks = signingTLV(4, Array(plist.prefix(split))) + signingTLV(4, Array(plist.dropFirst(split)))
+        let content = signingTLV(6, oid + [1]) + signingTLV(0xa0, signingTLV(0x24, chunks))
+        let signed = signingTLV(2, [1]) + signingTLV(0x31, []) + signingTLV(0x30, content) + signingTLV(0x31, [])
+        // CMS allows indefinite lengths and split octet strings. An unsigned fixture is sufficient to read fields.
+        return Data([0x30, 0x80] + signingTLV(6, oid + [2]) + signingTLV(0xa0, signingTLV(0x30, signed)) + [0, 0])
+    }
+
+    func testSigningReadsModernDERBeforeXMLAndChecksStrictProfileTypes() throws {
+        let entries = signingEntry("dialing-app", [1, 1, 255]) + signingEntry("calling-app", [1, 1, 0])
+        let modern = signingTLV(0x70, signingTLV(2, [1]) + signingTLV(0xb0, entries))
+        let xml = try PropertyListSerialization.data(fromPropertyList: ["com.apple.developer.dialing-app": false],
+                                                       format: .xml, options: 0)
+        let profile = try signingProfile([
+            "com.apple.developer.dialing-app": true,
+            "com.apple.developer.messaging-app": 1
+        ])
+        let rows = IPhoneSigningDiagnostics.rows(executable: signingImage(der: modern, xml: Array(xml)), profile: profile)
+        XCTAssertEqual(rows[0].1, "主 App 签名 · DER · false\n描述文件可读字段 · 未声明")
+        XCTAssertEqual(rows[1].1, "主 App 签名 · DER · true\n描述文件可读字段 · true")
+        XCTAssertEqual(rows[2].1, "主 App 签名 · DER · 未声明\n描述文件可读字段 · 字段类型异常")
+    }
+
+    func testSigningReadsLegacyDERAndMarksMalformedAndFallbackSources() throws {
+        let legacy = signingTLV(0x31, signingEntry("dialing-app", [2, 1, 1]))
+        let legacyRows = IPhoneSigningDiagnostics.rows(executable: signingImage(der: legacy), profile: nil)
+        XCTAssertTrue(legacyRows[1].1.contains("DER · 字段类型异常"))
+        let truncated = Array(legacy.dropLast())
+        let xml = try PropertyListSerialization.data(fromPropertyList: ["com.apple.developer.dialing-app": true],
+                                                       format: .xml, options: 0)
+        let fallback = IPhoneSigningDiagnostics.rows(executable: signingImage(der: truncated, xml: Array(xml)), profile: nil)
+        XCTAssertTrue(fallback[1].1.contains("XML（DER 不可读取） · true"))
+        let invalid = IPhoneSigningDiagnostics.rows(executable: signingImage(der: truncated), profile: Data(xml))
+        XCTAssertTrue(invalid[1].1.contains("主 App 签名 · 不可读取"))
+        XCTAssertTrue(invalid[1].1.contains("描述文件不可读取"))
+        let shortImage = Data(signingImage(der: legacy).dropLast())
+        XCTAssertTrue(IPhoneSigningDiagnostics.rows(executable: shortImage, profile: nil)[1].1.contains("不可读取"))
     }
 }

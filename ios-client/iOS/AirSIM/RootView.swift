@@ -110,8 +110,8 @@ struct RootView: View {
     @AppStorage("airsim.selected-tab") private var selectedTabRawValue = PhoneTab.dial.rawValue
     @State private var collapsedCallID: String?
     @State private var dialLineRequest: DialLineRequest?
-    @State private var selectedDialLine: DialLineID?
-    @State private var iPhoneLines: [IPhoneCellularLine] = []
+    @AppStorage(DialLinePreference.storageKey) private var defaultDialLineData = Data()
+    @State private var iPhoneInventory: IPhoneCellularLineInventory = .notQueried
     @State private var submittingDial = false
     @State private var pendingSMSRecipient: String?
     @State private var messageListState = SMSConversationListState()
@@ -221,7 +221,9 @@ struct RootView: View {
         }
         .background(PhoneBackdrop())
         .modifier(IPhoneCarrierPresentation())
-        .modifier(DialLinePicker(request: $dialLineRequest, selected: activeDialLine?.id, choose: selectDialLine))
+        .modifier(DialLinePicker(request: $dialLineRequest, inventory: $iPhoneInventory,
+            preference: defaultDialPreference,
+            choose: selectDialLine, reset: resetDialDefault))
         .onChange(of: model.callLifecycleSnapshot.state.representsCall) { inCall in
             if inCall { dialLineRequest = nil }
         }
@@ -277,11 +279,19 @@ struct RootView: View {
         }
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
-            iPhoneLines = IPhoneCellularDialer.availableLines
             presentAppUpdateIfIdle()
             if firstConnectionComplete && appUpdateCallIdle {
                 _ = await appUpdates.check(manual: false)
                 presentAppUpdateIfIdle()
+            }
+        }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            iPhoneInventory = IPhoneCellularDialer.lineInventory
+            // Recheck after foreground activation if the first native query came back empty.
+            if case .reported(let lines) = iPhoneInventory, lines.isEmpty {
+                do { try await Task.sleep(nanoseconds: 1_000_000_000) } catch { return }
+                iPhoneInventory = IPhoneCellularDialer.lineInventory
             }
         }
         .onChange(of: appUpdates.needsNotes) { _ in presentAppUpdateIfIdle() }
@@ -382,43 +392,38 @@ struct RootView: View {
     }
 
     private func dialLines(_ local: [IPhoneCellularLine]) -> [DialLineChoice] {
-        let agent = dialAgentID
-        return DialLineChoice.roster(agentID: agent, slots: agent.map { model.simSlots(for: $0) } ?? [],
-            hasAndroid: agent != nil || model.canStartOutgoingCommand, local: local,
-            supportsSystem: IPhoneCellularDialer.supportsSystemFallback)
+        DialLineChoice.roster(model: model, local: local)
+    }
+
+    private var defaultDialPreference: DialLinePreference {
+        DialLinePreference(data: defaultDialLineData)
     }
 
     private var activeDialLine: DialLineChoice? {
-        let choices = dialLines(iPhoneLines)
-        if let selectedDialLine { return choices.first { $0.id == selectedDialLine } }
-        if let agent = dialAgentID, let saved = model.selectedSIMSlotID(for: agent),
-           let line = choices.first(where: { $0.id == .android(agentID: agent, slotID: saved) }) { return line }
-        if let android = choices.first(where: { $0.id.isAndroid }) { return android }
-        if iPhoneLines.count > 1, let system = choices.first(where: { $0.id == .system }) { return system }
-        return choices.first
+        let choices = dialLines(iPhoneInventory.lines)
+        let oldAndroidDefault = dialAgentID.flatMap { agent in
+            model.selectedSIMSlotID(for: agent).map { DialLineID.android(agentID: agent, slotID: $0) }
+        }
+        return defaultDialPreference.resolve(in: choices, androidDefault: oldAndroidDefault)
     }
 
     private var dialPad: some View {
         let line = activeDialLine
-        return DialPadView(lineTitle: line?.title ?? "选择通话线路",
+        let missingTitle = defaultDialPreference == .automatic
+            ? "选择通话线路" : "所选线路不可用 · 重新选择"
+        return DialPadView(lineTitle: line?.title ?? missingTitle,
             canDial: dialIdle && line.map { !$0.id.isAndroid || (!model.isBusy && model.canStartOutgoingCommand) } == true,
             canChooseLine: dialIdle, chooseLine: { presentDialLines() },
-            chooseAndroid: { agentID in
-                model.bindAndroidAgent(agentID)
-                selectedDialLine = nil
-            },
+            chooseAndroid: model.bindAndroidAgent,
             submit: { if let line { submitDial(using: line.id) } })
     }
 
     private func presentDialLines(onlyIfMultiple: Bool = false) {
         guard dialIdle else { return }
-        iPhoneLines = IPhoneCellularDialer.availableLines
-        let choices = dialLines(iPhoneLines)
-        guard !choices.isEmpty else {
-            if !onlyIfMultiple { model.errorMessage = "当前没有可用的通话线路" }
-            return
-        }
-        if !onlyIfMultiple || choices.count > 1 {
+        iPhoneInventory = IPhoneCellularDialer.lineInventory
+        let choices = dialLines(iPhoneInventory.lines)
+        if onlyIfMultiple, defaultDialPreference != .automatic, activeDialLine != nil { return }
+        if !onlyIfMultiple || choices.count > 1 || (activeDialLine == nil && !choices.isEmpty) {
             dialLineRequest = DialLineRequest(number: model.numberInput, choices: choices)
         }
     }
@@ -431,24 +436,33 @@ struct RootView: View {
         presentDialLines(onlyIfMultiple: true)
     }
 
+    private func resetDialDefault(_ request: DialLineRequest) {
+        guard dialIdle, dialLineRequest?.id == request.id else { return }
+        defaultDialLineData = Data()
+        dialLineRequest = nil
+    }
+
     private func selectDialLine(_ request: DialLineRequest, _ line: DialLineChoice) {
-        // A stale popover must never select a route for a newer external dial request.
         guard dialLineRequest?.id == request.id else { return }
         dialLineRequest = nil
-        iPhoneLines = IPhoneCellularDialer.availableLines
-        guard request.permits(line.id, number: model.numberInput, live: dialLines(iPhoneLines), idle: dialIdle) else {
+        iPhoneInventory = IPhoneCellularDialer.lineInventory
+        guard request.permits(line.id, number: model.numberInput, live: dialLines(iPhoneInventory.lines), idle: dialIdle) else {
             model.errorMessage = "号码或通话线路已变化，请重新选择"
             return
         }
-        if case let .android(agent?, slot?) = line.id { model.selectSIMSlot(slot, for: agent) }
-        selectedDialLine = line.id
+        do {
+            defaultDialLineData = try JSONEncoder().encode(line.id)
+            if case let .android(agent?, slot?) = line.id { model.selectSIMSlot(slot, for: agent) }
+        } catch {
+            model.errorMessage = "无法保存默认拨号线路"
+        }
     }
 
     private func submitDial(using route: DialLineID) {
         guard dialIdle, !model.numberInput.isEmpty else { return }
         let number = model.numberInput
-        iPhoneLines = IPhoneCellularDialer.availableLines
-        guard dialLines(iPhoneLines).contains(where: { $0.id == route }) else {
+        iPhoneInventory = IPhoneCellularDialer.lineInventory
+        guard dialLines(iPhoneInventory.lines).contains(where: { $0.id == route }) else {
             model.errorMessage = "所选通话线路已不可用，请重新选择"
             return
         }
@@ -461,7 +475,7 @@ struct RootView: View {
                 switch route {
                 case let .android(agent, slot):
                     guard !model.isBusy, model.canStartOutgoingCommand, agent == dialAgentID,
-                          dialLines(iPhoneLines).contains(where: { $0.id == route }) else {
+                          dialLines(iPhoneInventory.lines).contains(where: { $0.id == route }) else {
                         model.errorMessage = "安卓通话线路已变化或离线，请重新选择"
                         return
                     }
@@ -806,7 +820,7 @@ private struct AdaptiveMessagesView: View {
 }
 
 
-enum DialLineID: Hashable {
+enum DialLineID: Hashable, Codable {
     case android(agentID: String?, slotID: String?)
     case iPhone(UUID)
     case system
@@ -817,9 +831,61 @@ enum DialLineID: Hashable {
     }
 }
 
+enum DialLinePreference: Equatable {
+    case automatic, chosen(DialLineID), unreadable
+
+    static let storageKey = "airsim.default-outgoing-voice-line.v1"
+
+    static func storedSummary(in inventory: IPhoneCellularLineInventory, defaults: UserDefaults = .standard) -> String {
+        let saved = Self(data: defaults.data(forKey: storageKey) ?? Data())
+        switch saved {
+        case .automatic: return "自动（优先已配对的安卓线路）"
+        case .unreadable: return "已保存的线路设置无法读取，请重新选择"
+        case .chosen(.system): return "iPhone 系统选线"
+        case .chosen(.android): return "指定安卓线路"
+        case .chosen(.iPhone(let id)):
+            switch inventory {
+            case .reported(let lines):
+                return lines.contains { $0.id == id } ? "指定 iPhone SIM（本次可见）" : "指定 iPhone SIM（本次未返回）"
+            default: return "指定 iPhone SIM（尚未核实可用性）"
+            }
+        }
+    }
+
+    init(data: Data) {
+        if data.isEmpty { self = .automatic }
+        else if let id = try? JSONDecoder().decode(DialLineID.self, from: data) { self = .chosen(id) }
+        else { self = .unreadable }
+    }
+
+    func resolve(in choices: [DialLineChoice], androidDefault: DialLineID?) -> DialLineChoice? {
+        switch self {
+        case .unreadable: return nil
+        case .chosen(let id): return choices.first { $0.id == id }
+        case .automatic:
+            if let androidDefault, let line = choices.first(where: { $0.id == androidDefault }) { return line }
+            if let android = choices.first(where: { $0.id.isAndroid }) { return android }
+            let local = choices.filter { choice in
+                if case .iPhone = choice.id { return true }
+                return false
+            }
+            if local.count == 1 { return local.first }
+            return choices.first { $0.id == .system }
+        }
+    }
+}
+
 struct DialLineChoice: Identifiable, Equatable {
     let id: DialLineID
     let title: String
+
+    @MainActor
+    static func roster(model: AppModel, local: [IPhoneCellularLine]) -> [Self] {
+        let agent = AndroidAgentBindingPreference.selected() ?? model.currentAndroidAgent?.id
+        return roster(agentID: agent, slots: agent.map { model.simSlots(for: $0) } ?? [],
+            hasAndroid: agent != nil || model.canStartOutgoingCommand, local: local,
+            supportsSystem: IPhoneCellularDialer.supportsSystemFallback)
+    }
 
     static func roster(agentID: String?, slots: [AndroidSIMSlot], hasAndroid: Bool,
                        local: [IPhoneCellularLine], supportsSystem: Bool) -> [Self] {
@@ -833,15 +899,21 @@ struct DialLineChoice: Identifiable, Equatable {
             choices.append(Self(id: .android(agentID: agentID, slotID: nil), title: "安卓默认线路"))
         }
         choices += local.map { Self(id: .iPhone($0.id), title: "iPhone · \($0.label)") }
-        if supportsSystem { choices.append(Self(id: .system, title: "iPhone · 系统选线")) }
+        if supportsSystem { choices.append(Self(id: .system, title: "iPhone · 由系统选择 SIM")) }
         return choices
     }
 }
 
 struct DialLineRequest: Identifiable {
-    let id = UUID()
+    let id: UUID
     let number: String
     let choices: [DialLineChoice]
+
+    init(id: UUID = UUID(), number: String, choices: [DialLineChoice]) {
+        self.id = id
+        self.number = number
+        self.choices = choices
+    }
 
     func permits(_ route: DialLineID, number currentNumber: String, live: [DialLineChoice], idle: Bool) -> Bool {
         idle && number == currentNumber && choices.contains { $0.id == route } && live.contains { $0.id == route }
@@ -850,37 +922,76 @@ struct DialLineRequest: Identifiable {
 
 private struct DialLinePicker: ViewModifier {
     @Binding var request: DialLineRequest?
-    let selected: DialLineID?
+    @Binding var inventory: IPhoneCellularLineInventory
+    let preference: DialLinePreference
     let choose: (DialLineRequest, DialLineChoice) -> Void
+    let reset: (DialLineRequest) -> Void
 
     func body(content: Content) -> some View {
         content.overlay {
             Color.clear.frame(width: 1, height: 1)
                 .popover(item: $request) { captured in
-                    VStack(alignment: .leading, spacing: 0) {
-                        Text("拨号用卡").font(.headline).padding(.bottom, 6)
-                        ForEach(captured.choices) { line in
-                            Button {
-                                choose(captured, line)
-                            } label: {
-                                HStack {
-                                    Image(systemName: line.id.isAndroid ? "simcard" : "iphone")
-                                    Text(line.title).multilineTextAlignment(.leading)
-                                    Spacer(minLength: 8)
-                                    if selected == line.id { Image(systemName: "checkmark") }
-                                }
-                                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .accessibilityAddTraits(selected == line.id ? .isSelected : [])
-                        }
-                    }
-                    .padding(16)
-                    .frame(idealWidth: 280)
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
-                    .compactSIMPopoverPresentation()
+                    DialLinePickerContents(request: captured, inventory: $inventory,
+                        preference: preference, choose: choose, reset: reset)
+                        .compactSIMPopoverPresentation()
                 }
         }
+    }
+}
+
+private struct DialLinePickerContents: View {
+    @EnvironmentObject private var model: AppModel
+    let request: DialLineRequest
+    @Binding var inventory: IPhoneCellularLineInventory
+    let preference: DialLinePreference
+    let choose: (DialLineRequest, DialLineChoice) -> Void
+    let reset: (DialLineRequest) -> Void
+
+    var body: some View {
+        let choices = DialLineChoice.roster(model: model, local: inventory.lines)
+        VStack(alignment: .leading, spacing: 4) {
+            Text("默认拨号线路").font(.headline)
+            HStack {
+                Text(inventory.summary).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button { inventory = IPhoneCellularDialer.lineInventory } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .accessibilityLabel("刷新本机线路")
+            }
+            if case .reported(let lines) = inventory, lines.isEmpty {
+                Text("系统选线仍可尝试。读取具体 SIM 还取决于默认通话 App 的权限，可在 AirSIM 设置的系统诊断中核对。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Button { reset(request) } label: {
+                row("自动（优先已配对的安卓线路）", icon: "arrow.triangle.branch",
+                    selected: preference == .automatic)
+            }
+            ForEach(choices) { line in
+                Button {
+                    let visible = DialLineRequest(id: request.id, number: request.number,
+                        choices: choices)
+                    choose(visible, line)
+                } label: {
+                    row(line.title, icon: line.id.isAndroid ? "simcard" : "iphone", selected: preference == .chosen(line.id))
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .padding(16)
+        .frame(idealWidth: 315)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private func row(_ title: String, icon: String, selected: Bool) -> some View {
+        HStack {
+            Image(systemName: icon)
+            Text(title).multilineTextAlignment(.leading)
+            Spacer(minLength: 8)
+            if selected { Image(systemName: "checkmark") }
+        }
+        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+        .contentShape(Rectangle())
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }

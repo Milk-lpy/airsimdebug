@@ -11,17 +11,42 @@ struct IPhoneMessagingLine: Identifiable, Hashable {
     let supportsSMS: Bool
     let supportsMMS: Bool
     let supportsRCS: Bool
+
+    var protocols: [String] {
+        var result: [String] = []
+        if supportsSMS { result.append("SMS") }
+        if supportsMMS { result.append("MMS") }
+        if supportsRCS { result.append("RCS") }
+        return result
+    }
+}
+
+enum IPhoneCarrierRole: Equatable { case checking, unsupported, inactive, configured }
+
+enum IPhoneCarrierStreamState: Equatable {
+    case connecting, listening, retrying(String)
+    var description: String {
+        switch self {
+        case .connecting: return "正在连接"
+        case .listening: return "已订阅"
+        case .retrying(let detail): return "等待重试 · " + detail
+        }
+    }
 }
 
 @MainActor
 final class IPhoneCarrierMessaging: ObservableObject {
     static let shared = IPhoneCarrierMessaging()
 
-    @Published private(set) var isConfigured = false
+    @Published private(set) var role: IPhoneCarrierRole = .checking
+    var isConfigured: Bool { role == .configured }
+    @Published private(set) var lineReadError: String?
+    @Published private(set) var receiverStates: [String: IPhoneCarrierStreamState] = [:]
     @Published private(set) var lines: [IPhoneMessagingLine] = []
     @Published private(set) var lastError: String?
     @Published private(set) var notificationsEnabled: Bool?
-    private var listeners: [Task<Void, Never>] = []
+    private var listeners: [String: Task<Void, Never>] = [:]
+    private var retrying = Set<String>()
     private var mailboxRetry: Task<Void, Never>?
     private var pendingWrites: [String: IPhoneCarrierRecord] = [:]
     private var pendingReceipts: [String: [String]] = [:]
@@ -29,9 +54,15 @@ final class IPhoneCarrierMessaging: ObservableObject {
     private init() {}
 
     func requestNotifications() async {
+        let center = UNUserNotificationCenter.current()
+        if await center.notificationSettings().authorizationStatus == .denied,
+           let settingsURL = URL(string: UIApplication.openNotificationSettingsURLString) {
+            await UIApplication.shared.open(settingsURL)
+            return
+        }
         do {
-            _ = try await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
-        } catch { lastError = error.localizedDescription }
+            _ = try await center.requestAuthorization(options: [.alert, .sound])
+        } catch { lastError = Self.diagnostic(error) }
         await refreshNotificationPermission()
     }
 
@@ -40,11 +71,11 @@ final class IPhoneCarrierMessaging: ObservableObject {
         notificationsEnabled = [.authorized, .provisional, .ephemeral].contains(status)
     }
 
-    func refresh() {
+    func refresh(retryNow: Bool = false) {
         Task {
             await refreshNotificationPermission()
             for record in pendingWrites.values.sorted(by: { $0.date < $1.date }) {
-                do { try await receive(record) } catch { lastError = error.localizedDescription }
+                do { try await receive(record) } catch { lastError = Self.diagnostic(error) }
             }
             let receipts = pendingReceipts
             pendingReceipts.removeAll()
@@ -54,57 +85,58 @@ final class IPhoneCarrierMessaging: ObservableObject {
             if #available(iOS 26, *), isConfigured {
                 do {
                     for record in try IPhoneMailbox.shared.pendingRCSDownloads() { enqueueDownload(for: record) }
-                } catch { lastError = error.localizedDescription }
+                } catch { lastError = Self.diagnostic(error) }
             }
         }
-        guard #available(iOS 26, *), UIDevice.current.userInterfaceIdiom == .phone,
-              TelephonyMessagingSession.shared.isConfiguredForCarrierMessaging else {
-            listeners.forEach { $0.cancel() }
-            listeners.removeAll()
-            mailboxRetry?.cancel()
-            mailboxRetry = nil
-            lines = []
-            isConfigured = false
-            lastError = nil
+        guard #available(iOS 26, *), UIDevice.current.userInterfaceIdiom == .phone else {
+            reset(to: .unsupported)
             return
         }
-        isConfigured = true
         let session = TelephonyMessagingSession.shared
+        guard session.isConfiguredForCarrierMessaging else { reset(to: .inactive); return }
+        role = .configured
         refreshLines(session)
-        guard listeners.isEmpty else { return }
-        // iOS queues carrier messages while we are unavailable. A cold wake can occur
-        // before the first unlock, when the local protected database cannot store them.
-        do {
-            try IPhoneMailbox.shared.requireWritable()
-            mailboxRetry?.cancel()
-            mailboxRetry = nil
-        } catch {
-            lastError = error.localizedDescription
-            if mailboxRetry == nil {
-                mailboxRetry = Task {
-                    do { try await Task.sleep(nanoseconds: 15_000_000_000) } catch { return }
-                    mailboxRetry = nil
-                    refresh()
-                }
-            }
-            return
+        if retryNow {
+            for key in retrying { listeners.removeValue(forKey: key)?.cancel() }
+            retrying.removeAll()
         }
-        listen { [self] in
+        if listeners.isEmpty {
+            // iOS queues carrier messages while we are unavailable. A cold wake can occur
+            // before the first unlock, when the local protected database cannot store them.
+            do {
+                try IPhoneMailbox.shared.requireWritable()
+                mailboxRetry?.cancel()
+                mailboxRetry = nil
+            } catch {
+                lastError = Self.diagnostic(error)
+                if mailboxRetry == nil {
+                    mailboxRetry = Task {
+                        do { try await Task.sleep(nanoseconds: 15_000_000_000) } catch { return }
+                        mailboxRetry = nil
+                        refresh()
+                    }
+                }
+                return
+            }
+        }
+        listen("accounts") { [self] in
             for await _ in session.cellularServiceStateUpdates { refreshLines(session) }
         }
-        listen { [self] in
+        listen("SMS", incoming: true) { [self] in
             let notifications = try session.smsService.incomingMessageNotifications
+            receiverStates["SMS"] = .listening
             for await entry in notifications {
                 do {
                     let sms = entry.message
                     let record = try incomingRecord(kind: "SMS", id: String(sms.messageID.rawValue),
                         service: sms.cellularServiceID, peer: sms.handle.phoneNumber, body: sms.content.body)
                     try await receive(record)
-                } catch { lastError = error.localizedDescription }
+                } catch { lastError = Self.diagnostic(error) }
             }
         }
-        listen { [self] in
+        listen("MMS", incoming: true) { [self] in
             let notifications = try session.mmsService.incomingMessageNotifications
+            receiverStates["MMS"] = .listening
             for await entry in notifications {
                 do {
                     let message: MMSMessage
@@ -114,58 +146,103 @@ final class IPhoneCarrierMessaging: ObservableObject {
                                                                               messageID: entry.messageID)
                     }
                     try await receive(mmsRecord(message))
-                } catch { lastError = error.localizedDescription }
+                } catch { lastError = Self.diagnostic(error) }
             }
         }
-        listen { [self] in
+        listen("RCS", incoming: true) { [self] in
             let notifications = try session.rcsService.incomingMessageNotifications
+            receiverStates["RCS"] = .listening
             for await entry in notifications {
-                do { try await receiveRCS(entry) } catch { lastError = error.localizedDescription }
+                do { try await receiveRCS(entry) } catch { lastError = Self.diagnostic(error) }
             }
         }
-        listen { [self] in
+        listen("sms-viability") { [self] in
             let notifications = try session.smsService.viabilityNotifications
             for await _ in notifications { refreshLines(session) }
         }
-        listen { [self] in
+        listen("mms-viability") { [self] in
             let notifications = try session.mmsService.viabilityNotifications
             for await _ in notifications { refreshLines(session) }
         }
-        listen { [self] in
+        listen("rcs-viability") { [self] in
             let notifications = try session.rcsService.viabilityNotifications
             for await _ in notifications { refreshLines(session) }
         }
     }
 
+    private func reset(to newRole: IPhoneCarrierRole) {
+        listeners.values.forEach { $0.cancel() }
+        listeners.removeAll()
+        retrying.removeAll()
+        receiverStates = [:]
+        mailboxRetry?.cancel()
+        mailboxRetry = nil
+        lines = []
+        role = newRole
+        lineReadError = nil
+        lastError = nil
+    }
+
+    /// Keep subscriber state separate from past message errors. Only surface diagnostics that
+    /// exclude sender addresses, attachment URLs and message content.
+    private static func diagnostic(_ error: Error) -> String {
+        let e = error as NSError
+        return "\(e.domain) (\(e.code))"
+    }
+
     @available(iOS 26, *)
-    private func listen(_ operation: @escaping @MainActor () async throws -> Void) {
-        listeners.append(Task {
+    private func listen(_ key: String, incoming: Bool = false, _ operation: @escaping @MainActor () async throws -> Void) {
+        guard listeners[key] == nil else { return }
+        if incoming { receiverStates[key] = .connecting }
+        listeners[key] = Task {
             var delay = 2
-            while !Task.isCancelled && TelephonyMessagingSession.shared.isConfiguredForCarrierMessaging {
-                do { try await operation() } catch {
-                    if !Task.isCancelled { lastError = error.localizedDescription }
+            while !Task.isCancelled {
+                // Role loss can occur before this newly scheduled task gets its first turn.
+                // Remove all recorded task handles so the next activation can resubscribe.
+                guard TelephonyMessagingSession.shared.isConfiguredForCarrierMessaging else {
+                    reset(to: .inactive)
+                    return
                 }
+                retrying.remove(key)
+                var detail = "订阅已结束"
+                do { try await operation() } catch { detail = Self.diagnostic(error) }
                 guard !Task.isCancelled else { return }
-                if !TelephonyMessagingSession.shared.isConfiguredForCarrierMessaging { refresh(); return }
+                guard TelephonyMessagingSession.shared.isConfiguredForCarrierMessaging else {
+                    reset(to: .inactive)
+                    return
+                }
+                retrying.insert(key)
+                if incoming { receiverStates[key] = .retrying(detail) }
+                else if key == "accounts" { lineReadError = detail }
                 do { try await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000) }
                 catch { return }
+                if incoming { receiverStates[key] = .connecting }
                 delay = min(delay * 2, 120)
             }
-        })
+        }
     }
 
     @available(iOS 26, *)
     private func refreshLines(_ session: TelephonyMessagingSession) {
         do {
-            lines = try session.cellularServices.map { state in
-                try IPhoneMessagingLine(id: encodedKey(state.id), label: state.label,
-                    supportsSMS: session.smsService.isViable(for: state.id),
-                    supportsMMS: session.mmsService.isViable(for: state.id),
-                    supportsRCS: session.rcsService.isViable(for: state.id))
+            var result: [IPhoneMessagingLine] = []
+            var issue: String?
+            let states = try session.cellularServices
+            for state in states {
+                do {
+                    let id = try encodedKey(state.id)
+                    guard !result.contains(where: { $0.id == id }) else { continue }
+                    result.append(IPhoneMessagingLine(id: id, label: state.label.isEmpty ? "线路 \(result.count + 1)" : state.label,
+                        supportsSMS: session.smsService.isViable(for: state.id),
+                        supportsMMS: session.mmsService.isViable(for: state.id),
+                        supportsRCS: session.rcsService.isViable(for: state.id)))
+                } catch { issue = Self.diagnostic(error) }
             }
+            lines = result
+            lineReadError = issue
         } catch {
             lines = []
-            lastError = error.localizedDescription
+            lineReadError = Self.diagnostic(error)
         }
     }
 
@@ -207,7 +284,7 @@ final class IPhoneCarrierMessaging: ObservableObject {
             // A receipt can refer to a message sent by the previous default app.
         } catch {
             if pendingReceipts[id]?.last != status { pendingReceipts[id, default: []].append(status) }
-            lastError = error.localizedDescription
+            lastError = Self.diagnostic(error)
         }
     }
 
@@ -368,7 +445,7 @@ final class IPhoneCarrierMessaging: ObservableObject {
             do {
                 let attachment = try await download(metadata, service: service)
                 try IPhoneMailbox.shared.updateAttachments(id: record.id, to: [attachment])
-            } catch { lastError = error.localizedDescription }
+            } catch { lastError = Self.diagnostic(error) }
         }
     }
 
@@ -398,7 +475,7 @@ final class IPhoneCarrierMessaging: ObservableObject {
             throw MessagingError.empty
         }
         let session = TelephonyMessagingSession.shared
-        guard let state = try session.cellularServices.first(where: { try encodedKey($0.id) == lineID }) else {
+        guard let state = try session.cellularServices.first(where: { (try? encodedKey($0.id)) == lineID }) else {
             throw MessagingError.missingLine
         }
         let numericID = UInt32.random(in: 1...UInt32.max)
@@ -465,7 +542,7 @@ final class IPhoneCarrierMessaging: ObservableObject {
         do { try IPhoneMailbox.shared.updateStatus(id: id, to: "已发送") }
         catch {
             // The carrier already accepted this message. Keep the send successful so UI won't invite a duplicate.
-            lastError = "消息已提交，更新本机状态失败：\(error.localizedDescription)"
+            lastError = "消息已提交，更新本机状态失败 · \(Self.diagnostic(error))"
         }
     }
 

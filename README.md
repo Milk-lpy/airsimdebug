@@ -5,7 +5,8 @@
 | 平台 | 版本 | 源码与说明 | 安装包 |
 | --- | --- | --- | --- |
 | 安卓 Standalone | 0.9.8.27-home.12（153） | [安卓源码、安装与构建](android-client/) | [下载签名 APK](https://raw.githubusercontent.com/Milk-lpy/airsimdebug/main/binaries/android/AirSIM-Android-153.apk) |
-| iPhone 与 Apple Watch | **0.9.9（195）**，APNs Sandbox | [本机双卡、通话记录、短信与签名](ios-client/BUILD-195.md) · [导入旧记录](ios-client/tools/) | [下载 195 未签名 IPA](binaries/ios/AirSIM-iOS-0.9.9-build195-Sandbox-full-unsigned.ipa?raw=true) · [SHA-256](binaries/ios/AirSIM-iOS-0.9.9-build195-Sandbox-full-unsigned.ipa.sha256) |
+| iPhone 与 Apple Watch | **0.9.9（196）**，APNs Sandbox | [本机双卡、默认线路和历史自检](ios-client/BUILD-196.md) · [导入旧记录](ios-client/tools/) | [下载 196 未签名 IPA](binaries/ios/AirSIM-iOS-0.9.9-build196-Sandbox-full-unsigned.ipa?raw=true) · [SHA-256](binaries/ios/AirSIM-iOS-0.9.9-build196-Sandbox-full-unsigned.ipa.sha256) |
+| iOS 旧版 | 0.9.9（195），APNs Sandbox | [本机双卡、通话记录、短信与签名](ios-client/BUILD-195.md) · [导入旧记录](ios-client/tools/) | [下载 195 未签名 IPA](binaries/ios/AirSIM-iOS-0.9.9-build195-Sandbox-full-unsigned.ipa?raw=true) · [SHA-256](binaries/ios/AirSIM-iOS-0.9.9-build195-Sandbox-full-unsigned.ipa.sha256) |
 | iOS 上一版 | 0.9.9（194），APNs Sandbox | [194 源码](https://github.com/Milk-lpy/airsimdebug/tree/d54fbdabb895122bd2cadc9f79efd6ce930560ed/ios-client/iOS) · [194 构建说明](ios-client/BUILD-194.md) | [下载完整未签名 IPA](https://raw.githubusercontent.com/Milk-lpy/airsimdebug/main/binaries/ios/AirSIM-iOS-0.9.9-build194-Sandbox-full-unsigned.ipa) · [SHA-256](binaries/ios/AirSIM-iOS-0.9.9-build194-Sandbox-full-unsigned.ipa.sha256) |
 
 安卓包支持 Android 10 及以上，沿用家庭版签名。通用版使用系统信任的 HTTPS 证书。家庭网关使用专用 CA 时，请参考安卓构建说明。APK SHA-256 为 `3eb09f284b3755cb941c804a7359377ceb29c657eb3f395ebee0839866fc485a`。

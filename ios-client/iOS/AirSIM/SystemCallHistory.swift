@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import LiveCommunicationKit
+import XPC
 
 /// A view of the records iOS lets the default dialer read. Never written to the Agent or local history database.
 struct SystemCallEntry: Equatable {
@@ -74,12 +75,51 @@ private extension SystemCallEntry {
     }
 }
 
+struct SystemHistoryFailure: Equatable {
+    let domain: String
+    let code: Int
+    let canRetry: Bool?
+
+    init(_ error: Error) {
+        let ns = error as NSError
+        domain = ns.domain
+        code = ns.code
+        if #available(iOS 17.0, *), let rich = error as? XPCRichError {
+            canRetry = rich.canRetry
+        } else if domain == NSCocoaErrorDomain && code == CocoaError.Code.xpcConnectionInterrupted.rawValue {
+            canRetry = true
+        } else {
+            // An NSError that carries only the XPC domain and code has lost the retry flag.
+            canRetry = nil
+        }
+    }
+
+    var isXPC: Bool {
+        domain == "XPC.XPCRichError" || (domain == NSCocoaErrorDomain && (
+            code == CocoaError.Code.xpcConnectionInterrupted.rawValue || code == CocoaError.Code.xpcConnectionInvalid.rawValue))
+    }
+
+    var diagnostic: String {
+        var fields = ["ConversationHistoryManager.recentConversations", "\(domain) (\(code))"]
+        if let canRetry { fields.append("canRetry=\(canRetry)") }
+        return fields.joined(separator: " · ")
+    }
+}
+
+enum SystemHistoryReadState: Equatable {
+    case idle, unsupported, loading, ready
+    case failed(SystemHistoryFailure)
+
+    func canConfirmEmpty(hasOlder: Bool) -> Bool {
+        !hasOlder && (self == .ready || self == .unsupported)
+    }
+}
+
 @MainActor
 final class SystemCallHistory: ObservableObject {
     @Published private(set) var entries: [String: SystemCallEntry] = [:]
     @Published private(set) var hasOlder = false
-    @Published private(set) var problem: String?
-    @Published private(set) var loading = false
+    @Published private(set) var state: SystemHistoryReadState = .idle
 
     private let pageSize = 60
     private var limit = 60
@@ -87,7 +127,11 @@ final class SystemCallHistory: ObservableObject {
     private var refreshTask: Task<Void, Never>?
 
     func start() {
-        guard #available(iOS 26.0, *), observation == nil else { return }
+        guard #available(iOS 26.0, *) else { state = .unsupported; return }
+        if observation != nil {
+            if case .failed = state { refresh() }
+            return
+        }
         observation = NotificationCenter.default.addObserver(
             of: ConversationHistoryManager.self, for: .conversationHistoryDidUpdateMessage
         ) { [weak self] _ in
@@ -103,15 +147,14 @@ final class SystemCallHistory: ObservableObject {
         observation = nil
         refreshTask?.cancel()
         refreshTask = nil
-        loading = false
+        state = .idle
         entries = [:]
         hasOlder = false
-        problem = nil
         limit = pageSize
     }
 
     func loadOlder() {
-        guard hasOlder, !loading else { return }
+        guard hasOlder, state != .loading else { return }
         limit += pageSize
         refresh()
     }
@@ -119,43 +162,50 @@ final class SystemCallHistory: ObservableObject {
     func refresh(incremental: Bool = false) {
         guard #available(iOS 26.0, *), observation != nil else { return }
         refreshTask?.cancel()
-        loading = true
+        state = .loading
         let count = limit
         let boundary = incremental && hasOlder ? entries.values.map(\.date).min() : nil
         refreshTask = Task {
-            do {
-                let manager = ConversationHistoryManager.sharedInstance
-                let all = #Predicate<ConversationHistoryManager.RecentConversation> { _ in true }
-                let page: (entries: [SystemCallEntry], hasMore: Bool)
-                if let boundary {
-                    let recent = #Predicate<ConversationHistoryManager.RecentConversation> { $0.date >= boundary }
-                    let changed = try await manager.recentConversations(matching: recent)
+            var didRetry = false
+            while !Task.isCancelled {
+                do {
+                    let page = try await Self.fetchPage(count: count, boundary: boundary)
                     try Task.checkCancellation()
-                    let partial = SystemCallEntry.page(changed.map(SystemCallEntry.init), limit: count)
-                    if partial.entries.count >= count {
-                        // This query excluded the older pages that the previous snapshot reported.
-                        page = (partial.entries, true)
+                    let updated = Dictionary(uniqueKeysWithValues: page.entries.map { ($0.presentationID, $0) })
+                    if updated != entries { entries = updated }
+                    hasOlder = page.hasMore
+                    state = .ready
+                    return
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    // Access may have been revoked. Only Android and imported records may remain visible.
+                    entries = [:]
+                    hasOlder = false
+                    let failure = SystemHistoryFailure(error)
+                    if !didRetry && failure.canRetry == true {
+                        didRetry = true
+                        do { try await Task.sleep(nanoseconds: 600_000_000) } catch { return }
                     } else {
-                        let snapshot = try await manager.recentConversations(matching: all)
-                        page = SystemCallEntry.page(snapshot.map(SystemCallEntry.init), limit: count)
+                        state = .failed(failure)
+                        return
                     }
-                } else {
-                    let snapshot = try await manager.recentConversations(matching: all)
-                    page = SystemCallEntry.page(snapshot.map(SystemCallEntry.init), limit: count)
                 }
-                try Task.checkCancellation()
-                let updated = Dictionary(uniqueKeysWithValues: page.entries.map { ($0.presentationID, $0) })
-                if updated != entries { entries = updated }
-                hasOlder = page.hasMore
-                problem = nil
-            } catch {
-                guard !Task.isCancelled else { return }
-                // A failed access check must also remove previously readable carrier records.
-                entries = [:]
-                hasOlder = false
-                problem = "无法读取 iPhone 通话记录。请确认 AirSIM 已设为默认拨号 App。\n" + error.localizedDescription
             }
-            loading = false
         }
+    }
+
+    @available(iOS 26.0, *)
+    private static func fetchPage(count: Int, boundary: Date?) async throws -> (entries: [SystemCallEntry], hasMore: Bool) {
+        let manager = ConversationHistoryManager.sharedInstance
+        if let boundary {
+            let recent = #Predicate<ConversationHistoryManager.RecentConversation> { $0.date >= boundary }
+            let changed = try await manager.recentConversations(matching: recent)
+            try Task.checkCancellation()
+            let partial = SystemCallEntry.page(changed.map(SystemCallEntry.init), limit: count)
+            if partial.entries.count >= count { return (partial.entries, true) }
+        }
+        let all = #Predicate<ConversationHistoryManager.RecentConversation> { _ in true }
+        let snapshot = try await manager.recentConversations(matching: all)
+        return SystemCallEntry.page(snapshot.map(SystemCallEntry.init), limit: count)
     }
 }

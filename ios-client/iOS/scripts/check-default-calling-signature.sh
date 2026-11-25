@@ -34,7 +34,7 @@ app=$1
 info="$app/Info.plist"
 signed="$work/signed.plist"
 profile="$work/profile.plist"
-/usr/bin/codesign -d --entitlements - "$app" > "$signed" 2>/dev/null ||
+/usr/bin/codesign -d --entitlements - --xml "$app" > "$signed" 2>/dev/null ||
     fail "No readable code signature. Use the final package after signing."
 [ -f "$app/embedded.mobileprovision" ] ||
     fail "The sideloaded app has no embedded provisioning profile."

@@ -82,14 +82,11 @@ struct IPhoneCarrierThreads: View {
                 .swipeActions { Button("删除", role: .destructive) { deleting = thread } }
             }
             if query.isEmpty {
-                if !carrier.isConfigured && UIDevice.current.userInterfaceIdiom == .phone {
-                    Text("收发本机短信需要 iOS 26 或更高版本，并在默认 App 设置中选用 AirSIM 处理运营商消息。")
-                        .font(.footnote).foregroundStyle(.secondary)
+                if UIDevice.current.userInterfaceIdiom == .phone {
+                    IPhoneCarrierStatus()
                 }
-                if carrier.isConfigured && carrier.notificationsEnabled == false {
-                    Button("启用本机消息通知") { Task { await carrier.requestNotifications() } }
-                }
-                if let error = carrier.lastError { Text(error).font(.footnote).foregroundStyle(.secondary) }
+                Text("以前保存在「信息」中的短信可从本机备份导入。")
+                    .font(.footnote).foregroundStyle(.secondary)
                 IPhoneHistoryImportButton()
             }
         }
@@ -103,6 +100,49 @@ struct IPhoneCarrierThreads: View {
                 self.deleting = nil
             }
         }
+    }
+}
+
+private struct IPhoneCarrierStatus: View {
+    @ObservedObject private var carrier = IPhoneCarrierMessaging.shared
+
+    private var summary: String {
+        switch carrier.role {
+        case .checking: return "正在检查本机运营商消息"
+        case .unsupported: return "本机运营商消息需要 iOS 26 或更高版本"
+        case .inactive: return "iOS 尚未启用 AirSIM 的运营商消息服务"
+        case .configured:
+            if carrier.lineReadError != nil { return "运营商消息已启用 · 线路读取异常" }
+            return "运营商消息已启用 · iOS 返回 " + String(carrier.lines.count) + " 条线路"
+        }
+    }
+
+    var body: some View {
+        DisclosureGroup(summary) {
+            if carrier.isConfigured {
+                ForEach(carrier.lines) { line in
+                    Text(line.label + " · " + (line.protocols.isEmpty ? "暂不可发送" : line.protocols.joined(separator: " / ")))
+                }
+                if let issue = carrier.lineReadError {
+                    Text("已识别 " + String(carrier.lines.count) + " 条线路，读取诊断 " + issue)
+                } else if carrier.lines.isEmpty {
+                    Text("iOS 尚未返回可列出的蜂窝线路。")
+                }
+                ForEach(["SMS", "MMS", "RCS"], id: \.self) { kind in
+                    Text(kind + " 收件 · " + (carrier.receiverStates[kind]?.description ?? "等候本机收件箱就绪"))
+                }
+                Text("iOS 会将新收到的运营商消息交给 AirSIM。")
+                if carrier.notificationsEnabled == false {
+                    Button("启用本机消息通知") { Task { await carrier.requestNotifications() } }
+                }
+            } else if carrier.role == .inactive {
+                Text("请在系统默认 App 设置中确认 AirSIM 已获准处理运营商消息，并检查本机的地区与系统版本是否支持。")
+            }
+            if let error = carrier.lastError { Text("最近操作错误 · " + error) }
+            if carrier.role != .unsupported {
+                Button("重新检查线路和收件") { carrier.refresh(retryNow: true) }
+            }
+        }.font(.footnote)
     }
 }
 
@@ -210,11 +250,16 @@ private struct IPhoneCarrierThread: View {
                         Text([last.importedThread == nil ? "iPhone" : "导入历史 · 只读", last.lineLabel, last.kind].filter { !$0.isEmpty }.joined(separator: " · "))
                             .font(.caption).foregroundStyle(.secondary)
                         if last.importedThread == nil {
+                            let canReply = carrier.isConfigured && carrier.lines.contains { $0.id == last.lineID && $0.protocols.contains(last.kind) }
+                            if !canReply {
+                                Text("此会话原来的 iPhone 线路暂时无法发送 " + last.kind + "。")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
                             HStack {
                                 TextField("回复", text: $draft, axis: .vertical).textFieldStyle(.roundedBorder).lineLimit(1...4)
                                 Button("发送") {
                                     if last.kind == "MMS" && last.groupID != nil { confirmingGroup = true } else { send(last) }
-                                }.disabled(sending || !carrier.isConfigured || (draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachment == nil))
+                                }.disabled(sending || !canReply || (draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachment == nil))
                             }
                             if last.kind != "SMS" { IPhoneMessageAttachmentPicker(attachment: $attachment, error: $error).disabled(sending) }
                         }
