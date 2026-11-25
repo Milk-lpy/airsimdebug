@@ -56,7 +56,13 @@ build = str(info.get("CFBundleVersion", "")).split(".")[0]
 full = sys.argv[4] == "full" or (build.isdigit() and int(build) >= 195)
 keys = ["calling-app"]
 if full:
-    keys += ["dialing-app", "messaging-app", "carrier-messaging-app"]
+    keys.append("dialing-app")
+    if build in {"195", "196"}:
+        keys += ["messaging-app", "carrier-messaging-app"]
+    elif build.isdigit() and int(build) >= 197:
+        for suffix in ("messaging-app", "carrier-messaging-app"):
+            if signature.get("com.apple.developer." + suffix):
+                issues.append(f"signature still requests {suffix}")
 
 issues = []
 for suffix in keys:

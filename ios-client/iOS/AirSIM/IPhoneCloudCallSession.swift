@@ -5,6 +5,7 @@ import UIKit
 
 enum IPhoneCloudCallError: LocalizedError {
     case mediaUnavailable
+    case unsupportedTransport
     case microphonePermissionDenied
     case microphoneUnavailable
     case invalidAudioFormat
@@ -13,6 +14,7 @@ enum IPhoneCloudCallError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .mediaUnavailable: return "来电没有可用的云端媒体凭证"
+        case .unsupportedTransport: return "此版本不支持 Relay 分配的音频协议"
         case .microphonePermissionDenied: return "需要麦克风权限才能进行云端通话"
         case .microphoneUnavailable: return "当前没有可用的麦克风输入"
         case .invalidAudioFormat: return "无法建立云端通话音频格式"
@@ -181,13 +183,7 @@ enum CloudMediaTransportNegotiator {
 }
 
 enum CloudMediaTransportPreference {
-    static let requestedKey = "airsim.cloud-media-requested-transport"
     static let forceLegacyKey = "airsim.cloud-media-force-legacy-pcm"
-
-    static func requested(defaults: UserDefaults = .standard) -> CloudMediaTransport {
-        guard let rawValue = defaults.string(forKey: requestedKey) else { return .legacyPCM }
-        return CloudMediaTransport(rawValue: rawValue) ?? .legacyPCM
-    }
 
     static func forceLegacy(defaults: UserDefaults = .standard) -> Bool {
         defaults.bool(forKey: forceLegacyKey)
@@ -940,6 +936,7 @@ final class IPhoneCloudCallSession {
     }
 
     func answer(_ incoming: IncomingVoIPCall) async throws {
+        guard incoming.supportsCloudPCM else { throw IPhoneCloudCallError.unsupportedTransport }
         guard let url = incoming.authenticatedMediaURL else {
             throw IPhoneCloudCallError.mediaUnavailable
         }

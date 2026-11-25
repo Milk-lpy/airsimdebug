@@ -4,7 +4,6 @@ import Intents
 
 enum SystemCommunicationDestination: Equatable {
     case call(String)
-    case message(String)
     case liveActivity(AirSIMLiveActivityAction, callID: String)
 }
 
@@ -13,10 +12,8 @@ enum SystemCommunicationURL {
         if let action = AirSIMLiveActivityActionURL.parse(url) {
             return .liveActivity(action.action, callID: action.callID)
         }
-        guard let scheme = url.scheme?.lowercased(), scheme == "tel" || scheme == "im" else {
-            return nil
-        }
-        let prefixLength = scheme.count + 1
+        guard url.scheme?.lowercased() == "tel" else { return nil }
+        let prefixLength = "tel:".count
         guard url.absoluteString.count > prefixLength else { return nil }
         var target = String(url.absoluteString.dropFirst(prefixLength))
         while target.hasPrefix("//") { target.removeFirst(2) }
@@ -24,8 +21,7 @@ enum SystemCommunicationURL {
         guard let decoded = target.removingPercentEncoding else { return nil }
         target = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !target.isEmpty else { return nil }
-        if scheme == "tel" { return dialableNumber(from: target).map(SystemCommunicationDestination.call) }
-        return .message(target)
+        return dialableNumber(from: target).map(SystemCommunicationDestination.call)
     }
 
     static func callNumber(for activity: NSUserActivity) -> String? {
@@ -223,7 +219,7 @@ struct RootView: View {
         .modifier(IPhoneCarrierPresentation())
         .modifier(DialLinePicker(request: $dialLineRequest, inventory: $iPhoneInventory,
             preference: defaultDialPreference,
-            choose: selectDialLine, reset: resetDialDefault))
+            choose: selectDialLine))
         .onChange(of: model.callLifecycleSnapshot.state.representsCall) { inCall in
             if inCall { dialLineRequest = nil }
         }
@@ -400,32 +396,31 @@ struct RootView: View {
     }
 
     private var activeDialLine: DialLineChoice? {
-        let choices = dialLines(iPhoneInventory.lines)
-        let oldAndroidDefault = dialAgentID.flatMap { agent in
-            model.selectedSIMSlotID(for: agent).map { DialLineID.android(agentID: agent, slotID: $0) }
-        }
-        return defaultDialPreference.resolve(in: choices, androidDefault: oldAndroidDefault)
+        defaultDialPreference.resolve(in: dialLines(iPhoneInventory.lines))
     }
 
     private var dialPad: some View {
         let line = activeDialLine
-        let missingTitle = defaultDialPreference == .automatic
+        let missingTitle = defaultDialPreference == .unselected
             ? "选择通话线路" : "所选线路不可用 · 重新选择"
+        let canSubmit = line.map { !$0.id.isAndroid || (!model.isBusy && model.canStartOutgoingCommand) }
+            ?? !dialLines(iPhoneInventory.lines).isEmpty
         return DialPadView(lineTitle: line?.title ?? missingTitle,
-            canDial: dialIdle && line.map { !$0.id.isAndroid || (!model.isBusy && model.canStartOutgoingCommand) } == true,
+            canDial: dialIdle && canSubmit,
             canChooseLine: dialIdle, chooseLine: { presentDialLines() },
             chooseAndroid: model.bindAndroidAgent,
-            submit: { if let line { submitDial(using: line.id) } })
+            submit: {
+                if let line { submitDial(using: line.id) }
+                else { presentDialLines() }
+            })
     }
 
-    private func presentDialLines(onlyIfMultiple: Bool = false) {
+    private func presentDialLines(onlyIfNeeded: Bool = false) {
         guard dialIdle else { return }
         iPhoneInventory = IPhoneCellularDialer.lineInventory
         let choices = dialLines(iPhoneInventory.lines)
-        if onlyIfMultiple, defaultDialPreference != .automatic, activeDialLine != nil { return }
-        if !onlyIfMultiple || choices.count > 1 || (activeDialLine == nil && !choices.isEmpty) {
-            dialLineRequest = DialLineRequest(number: model.numberInput, choices: choices)
-        }
+        if onlyIfNeeded && (activeDialLine != nil || choices.isEmpty) { return }
+        dialLineRequest = DialLineRequest(number: model.numberInput, choices: choices)
     }
 
     private func prefillDialPad(_ number: String) {
@@ -433,13 +428,7 @@ struct RootView: View {
         model.numberInput = number
         selectedTab = .dial
         dialLineRequest = nil
-        presentDialLines(onlyIfMultiple: true)
-    }
-
-    private func resetDialDefault(_ request: DialLineRequest) {
-        guard dialIdle, dialLineRequest?.id == request.id else { return }
-        defaultDialLineData = Data()
-        dialLineRequest = nil
+        presentDialLines(onlyIfNeeded: true)
     }
 
     private func selectDialLine(_ request: DialLineRequest, _ line: DialLineChoice) {
@@ -538,8 +527,6 @@ struct RootView: View {
         switch SystemCommunicationURL.destination(for: url) {
         case let .call(number):
             prefillDialPad(number)
-        case let .message(recipient):
-            composeMessage(recipient)
         case let .liveActivity(action, callID):
             // Legacy links still open the app; use the same unified path as intents
             // so a stale island is dismissed instead of showing a Bluetooth-call error.
@@ -832,14 +819,14 @@ enum DialLineID: Hashable, Codable {
 }
 
 enum DialLinePreference: Equatable {
-    case automatic, chosen(DialLineID), unreadable
+    case unselected, chosen(DialLineID), unreadable
 
     static let storageKey = "airsim.default-outgoing-voice-line.v1"
 
     static func storedSummary(in inventory: IPhoneCellularLineInventory, defaults: UserDefaults = .standard) -> String {
         let saved = Self(data: defaults.data(forKey: storageKey) ?? Data())
         switch saved {
-        case .automatic: return "自动（优先已配对的安卓线路）"
+        case .unselected: return "尚未选择"
         case .unreadable: return "已保存的线路设置无法读取，请重新选择"
         case .chosen(.system): return "iPhone 系统选线"
         case .chosen(.android): return "指定安卓线路"
@@ -853,25 +840,14 @@ enum DialLinePreference: Equatable {
     }
 
     init(data: Data) {
-        if data.isEmpty { self = .automatic }
+        if data.isEmpty { self = .unselected }
         else if let id = try? JSONDecoder().decode(DialLineID.self, from: data) { self = .chosen(id) }
         else { self = .unreadable }
     }
 
-    func resolve(in choices: [DialLineChoice], androidDefault: DialLineID?) -> DialLineChoice? {
-        switch self {
-        case .unreadable: return nil
-        case .chosen(let id): return choices.first { $0.id == id }
-        case .automatic:
-            if let androidDefault, let line = choices.first(where: { $0.id == androidDefault }) { return line }
-            if let android = choices.first(where: { $0.id.isAndroid }) { return android }
-            let local = choices.filter { choice in
-                if case .iPhone = choice.id { return true }
-                return false
-            }
-            if local.count == 1 { return local.first }
-            return choices.first { $0.id == .system }
-        }
+    func resolve(in choices: [DialLineChoice]) -> DialLineChoice? {
+        guard case .chosen(let id) = self else { return nil }
+        return choices.first { $0.id == id }
     }
 }
 
@@ -925,14 +901,13 @@ private struct DialLinePicker: ViewModifier {
     @Binding var inventory: IPhoneCellularLineInventory
     let preference: DialLinePreference
     let choose: (DialLineRequest, DialLineChoice) -> Void
-    let reset: (DialLineRequest) -> Void
 
     func body(content: Content) -> some View {
         content.overlay {
             Color.clear.frame(width: 1, height: 1)
                 .popover(item: $request) { captured in
                     DialLinePickerContents(request: captured, inventory: $inventory,
-                        preference: preference, choose: choose, reset: reset)
+                        preference: preference, choose: choose)
                         .compactSIMPopoverPresentation()
                 }
         }
@@ -945,28 +920,19 @@ private struct DialLinePickerContents: View {
     @Binding var inventory: IPhoneCellularLineInventory
     let preference: DialLinePreference
     let choose: (DialLineRequest, DialLineChoice) -> Void
-    let reset: (DialLineRequest) -> Void
 
     var body: some View {
         let choices = DialLineChoice.roster(model: model, local: inventory.lines)
         VStack(alignment: .leading, spacing: 4) {
-            Text("默认拨号线路").font(.headline)
             HStack {
-                Text(inventory.summary).font(.caption).foregroundStyle(.secondary)
+                Text("默认拨号线路").font(.headline)
                 Spacer()
                 Button { inventory = IPhoneCellularDialer.lineInventory } label: {
                     Image(systemName: "arrow.clockwise")
                 }
                 .accessibilityLabel("刷新本机线路")
             }
-            if case .reported(let lines) = inventory, lines.isEmpty {
-                Text("系统选线仍可尝试。读取具体 SIM 还取决于默认通话 App 的权限，可在 AirSIM 设置的系统诊断中核对。")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Button { reset(request) } label: {
-                row("自动（优先已配对的安卓线路）", icon: "arrow.triangle.branch",
-                    selected: preference == .automatic)
-            }
+            if choices.isEmpty { Text("没有可用线路").foregroundStyle(.secondary) }
             ForEach(choices) { line in
                 Button {
                     let visible = DialLineRequest(id: request.id, number: request.number,

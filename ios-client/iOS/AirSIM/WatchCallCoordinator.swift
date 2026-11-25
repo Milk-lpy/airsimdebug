@@ -580,8 +580,7 @@ final class WatchCallCoordinator: NSObject, WCSessionDelegate {
                 replyHandler(["ok": false, "error": "已取消拨号"])
                 return
             }
-            guard outgoing.requestedMediaTransport == .legacyPCM,
-                  let authenticatedURL = outgoing.authenticatedMediaURL,
+            guard let authenticatedURL = outgoing.authenticatedMediaURL,
                   var components = URLComponents(url: authenticatedURL, resolvingAgainstBaseURL: false),
                   let secret = components.queryItems?.first(where: { $0.name == "token" })?.value else {
                 await endAbandonedWatchCall(outgoing)

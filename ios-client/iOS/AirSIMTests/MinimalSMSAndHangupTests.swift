@@ -101,25 +101,51 @@ final class CallbackSIMDialChoiceTests: XCTestCase {
         let choices = roster("A", slots: slots, local: [primary, secondary])
         for choice in choices {
             let saved = DialLinePreference(data: try JSONEncoder().encode(choice.id))
-            XCTAssertEqual(saved.resolve(in: choices, androidDefault: nil)?.id, choice.id)
+            XCTAssertEqual(saved.resolve(in: choices)?.id, choice.id)
             let remaining = choices.filter { $0.id != choice.id }
-            XCTAssertNil(saved.resolve(in: remaining, androidDefault: remaining.first?.id))
+            XCTAssertNil(saved.resolve(in: remaining))
         }
         let data = try JSONEncoder().encode(DialLineID.iPhone(primary.id))
         let preference = DialLinePreference(data: data)
-        XCTAssertNil(preference.resolve(in: roster(nil, slots: [], local: []), androidDefault: nil))
-        XCTAssertEqual(preference.resolve(in: roster(nil, slots: [], local: [secondary, primary]), androidDefault: nil)?.id, .iPhone(primary.id))
-        XCTAssertNil(DialLinePreference(data: Data("invalid".utf8)).resolve(in: choices, androidDefault: nil))
+        XCTAssertNil(preference.resolve(in: roster(nil, slots: [], local: [])))
+        XCTAssertEqual(preference.resolve(in: roster(nil, slots: [], local: [secondary, primary]))?.id, .iPhone(primary.id))
+        XCTAssertNil(DialLinePreference(data: Data("invalid".utf8)).resolve(in: choices))
     }
 
-    func testAutomaticUsesPriorAndroidDefaultAndSystemChoiceIsSeparate() {
-        let automatic = DialLinePreference(data: Data())
-        let choices = roster("A", slots: slots, local: [primary, secondary])
-        let old = DialLineID.android(agentID: "A", slotID: slots[1].id)
-        XCTAssertEqual(automatic.resolve(in: choices, androidDefault: old)?.id, old)
-        XCTAssertEqual(automatic.resolve(in: roster(nil, slots: [], local: [primary]), androidDefault: nil)?.id, .iPhone(primary.id))
-        XCTAssertEqual(automatic.resolve(in: roster(nil, slots: [], local: [primary, secondary]), androidDefault: nil)?.id, .system)
-        XCTAssertEqual(DialLinePreference.chosen(.system).resolve(in: choices, androidDefault: old)?.id, .system)
+    func testUnsetAndOldAutomaticRequireExplicitChoiceEvenWhenLinesChange() {
+        let unset = DialLinePreference(data: Data())
+        XCTAssertEqual(unset, .unselected)
+        for choices in [roster(nil, slots: [], local: []), roster(nil, slots: [], local: [primary]),
+                        roster("A", slots: slots, local: [primary, secondary])] {
+            XCTAssertNil(unset.resolve(in: choices))
+            XCTAssertEqual(DialLinePreference.chosen(.system).resolve(in: choices)?.id, .system)
+        }
+    }
+
+    @MainActor func testRelayMediaPolicyPreservesIncomingIdentityWithoutOpeningUnsupportedAudio() async throws {
+        let uuid = UUID()
+        let url = try XCTUnwrap(URL(string: "wss://relay.example.invalid/v1/calls/\(uuid.uuidString)/connect"))
+        let secret = String(repeating: "x", count: 32)
+        let base: [AnyHashable: Any] = ["event": "incoming_call", "call_id": "test", "call_uuid": uuid.uuidString,
+                                      "call_secret": secret, "media_url": url.absoluteString]
+        for (assigned, supported) in [(nil, true), ("legacy_pcm", true), ("webrtc", false), ("unknown", false), ("", false)] as [(String?, Bool)] {
+            var payload = base
+            payload["media_transport"] = assigned
+            let incoming = try IncomingVoIPCall(userInfo: payload)
+            XCTAssertEqual(incoming.uuid, uuid)
+            XCTAssertEqual(incoming.supportsCloudPCM, supported)
+            XCTAssertEqual(try WatchVoIPCall(userInfo: payload).authenticatedMediaURL != nil, supported)
+            let outgoing = try IncomingVoIPCall(outgoingCallID: "test", uuid: uuid, number: "10086",
+                                               secret: secret, mediaURL: url, assignedTransport: assigned)
+            XCTAssertEqual(outgoing.supportsCloudPCM, supported)
+            if !supported {
+                do {
+                    try await IPhoneCloudCallSession.shared.answer(incoming)
+                    XCTFail("Unsupported media must fail before opening an audio session")
+                } catch IPhoneCloudCallError.unsupportedTransport {}
+            }
+        }
+        XCTAssertFalse(HomeRelayWirePolicy.permitsPCM(1))
     }
 
     func testNativeVoiceInventoryReportsOnlyActualServicesAndHidesIdentifiersInDiagnostics() throws {
@@ -158,7 +184,7 @@ final class ExternalDialHandoffTests: XCTestCase {
     }
 
     func testMalformedLinksDoNotProduceDialTargets() throws {
-        for link in ["tel:?10086", "tel:12345;ext=6789", "tel:12%0A34", "tel:123+45", "tel:%2B"] {
+        for link in ["im:10086", "sms:10086", "tel:?10086", "tel:12345;ext=6789", "tel:12%0A34", "tel:123+45", "tel:%2B"] {
             let url = try XCTUnwrap(URL(string: link))
             XCTAssertNil(SystemCommunicationURL.destination(for: url))
         }
@@ -436,72 +462,11 @@ final class AndroidFilteredSMSHandoffTests: XCTestCase {
     }
 }
 
-final class SystemCallHistoryTests: XCTestCase {
-
-    func testFailedQueryDoesNotReportAnEmptyHistory() {
-        let error = NSError(domain: "XPC.XPCRichError", code: 1,
-                            userInfo: [NSLocalizedDescriptionKey: "private data"])
-        let failure = SystemHistoryFailure(error)
-        XCTAssertTrue(failure.isXPC)
-        XCTAssertNil(failure.canRetry)
-        XCTAssertFalse(failure.diagnostic.contains("private data"))
-        XCTAssertFalse(SystemHistoryReadState.failed(failure).canConfirmEmpty(hasOlder: false))
-        XCTAssertFalse(SystemHistoryReadState.idle.canConfirmEmpty(hasOlder: false))
-        XCTAssertFalse(SystemHistoryReadState.loading.canConfirmEmpty(hasOlder: false))
-        XCTAssertFalse(SystemHistoryReadState.ready.canConfirmEmpty(hasOlder: true))
-        XCTAssertTrue(SystemHistoryReadState.ready.canConfirmEmpty(hasOlder: false))
-        XCTAssertTrue(SystemHistoryReadState.unsupported.canConfirmEmpty(hasOlder: false))
-    }
-
-    func testOnlyExplicitlyInterruptedCocoaConnectionQualifiesForAutomaticRetry() {
-        XCTAssertEqual(SystemHistoryFailure(CocoaError(.xpcConnectionInterrupted)).canRetry, true)
-        XCTAssertNil(SystemHistoryFailure(CocoaError(.xpcConnectionInvalid)).canRetry)
-        XCTAssertNil(SystemHistoryFailure(NSError(domain: "other", code: 1)).canRetry)
-    }
-    private func entry(_ id: UUID = UUID(), at seconds: TimeInterval = 10, number: String = "5550100") -> SystemCallEntry {
-        .init(id: id, date: Date(timeIntervalSince1970: seconds), direction: "incoming", status: "已接通",
-              missed: false, duration: 12, participants: [.init(label: number, phone: number)])
-    }
-
-    func testPageReplacesUpdatedUUIDAndKeepsCallsFromSameCaller() {
-        let before = entry()
-        let changed = entry(before.id, at: 20)
-        let other = entry(at: 15)
-        let page = SystemCallEntry.page([before, other, changed], limit: 1)
-        XCTAssertTrue(page.hasMore)
-        XCTAssertEqual(page.entries, [changed])
-        XCTAssertEqual(SystemCallEntry.page([before, other, changed], limit: 2).entries, [changed, other])
-    }
-
-    func testHistoryMergeRequiresExactSystemUUID() {
-        let system = entry()
-        func imported(_ id: String, native: UUID?) -> CallRecord {
-            CallRecord(id: id, index: 0, direction: "incoming", state: "ended", number: system.number,
-                       startedAt: system.date, updatedAt: system.date, endedAt: nil,
-                       missed: false, sourceCallID: native?.uuidString)
-        }
-        let copy = imported("iphone-import:copy", native: system.id)
-        let separate = imported("iphone-import:separate", native: nil)
-        let android = imported("agent-call:other", native: nil)
-        let records = SystemCallEntry.combinedRecords(android: [android], imported: [copy, separate], system: [system])
-        XCTAssertEqual(Set(records.map(\.id)), [android.id, separate.id, system.presentationID])
-        XCTAssertEqual(SystemCallEntry.combinedRecords(android: [], imported: [copy], system: []).first?.id, copy.id)
-    }
-
+final class HistoricalCallDialTests: XCTestCase {
     func testImportedFaceTimeEmailIsNotTreatedAsAnAndroidDialTarget() {
         XCTAssertNil(RecentCallDialPolicy.numberToDial("name@example.invalid", imported: true))
         XCTAssertEqual(RecentCallDialPolicy.numberToDial("tel:%2B1%20555-0100", imported: true), "+15550100")
         XCTAssertEqual(RecentCallDialPolicy.numberToDial("555 0100", imported: true), "5550100")
-    }
-
-    func testGroupCallDoesNotPreselectOneParticipant() {
-        let group = SystemCallEntry(id: UUID(), date: Date(), direction: "incoming", status: "未接来电",
-                                    missed: true, duration: nil, participants: [
-                                        .init(label: "First", phone: "5550100"), .init(label: "Second", phone: "5550200")])
-        XCTAssertNil(group.record.number)
-        XCTAssertEqual(group.displayParticipants, "First、Second")
-        XCTAssertTrue(group.record.missed)
-        XCTAssertNil(group.record.connectedAt)
     }
 }
 
@@ -635,7 +600,7 @@ final class IPhoneMailboxTests: XCTestCase {
     }
 }
 
-extension SystemCallHistoryTests {
+final class IPhoneSigningDiagnosticsTests: XCTestCase {
     private func signingTLV(_ tag: UInt8, _ bytes: [UInt8]) -> [UInt8] {
         let n = bytes.count
         if n < 128 { return [tag, UInt8(n)] + bytes }
@@ -687,12 +652,12 @@ extension SystemCallHistoryTests {
                                                        format: .xml, options: 0)
         let profile = try signingProfile([
             "com.apple.developer.dialing-app": true,
-            "com.apple.developer.messaging-app": 1
+            "com.apple.developer.calling-app": 1
         ])
         let rows = IPhoneSigningDiagnostics.rows(executable: signingImage(der: modern, xml: Array(xml)), profile: profile)
-        XCTAssertEqual(rows[0].1, "主 App 签名 · DER · false\n描述文件可读字段 · 未声明")
+        XCTAssertEqual(rows[0].1, "主 App 签名 · DER · false\n描述文件可读字段 · 字段类型异常")
         XCTAssertEqual(rows[1].1, "主 App 签名 · DER · true\n描述文件可读字段 · true")
-        XCTAssertEqual(rows[2].1, "主 App 签名 · DER · 未声明\n描述文件可读字段 · 字段类型异常")
+        XCTAssertEqual(rows.count, 2)
     }
 
     func testSigningReadsLegacyDERAndMarksMalformedAndFallbackSources() throws {

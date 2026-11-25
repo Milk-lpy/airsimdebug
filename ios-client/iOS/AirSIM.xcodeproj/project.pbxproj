@@ -39,10 +39,8 @@
         A732C0C0F49F510FB6E3C928 /* IPhoneMailbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = B732C0C0F49F510FB6E3C928; };
         A7C0A1000000000000000001 /* PhoneNavigationPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7C0A1000000000000000001; };
         A1CE11000000000000000001 /* IPhoneCellularDialer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1CE11000000000000000001; };
-        A1CE11000000000000000002 /* IPhoneCarrierMessaging.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1CE11000000000000000002; };
         A5C0A1000000000000000002 /* SMSConversationTimelineView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5C0A1000000000000000002; };
         A5C0A1000000000000000003 /* SMSConversationPresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5C0A1000000000000000003; };
-        A1CE11000000000000000003 /* IPhoneMMSGroupTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1CE11000000000000000003; };
         A5C0A1000000000000000004 /* SMSConversationInteractionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B5C0A1000000000000000004; };
 		AD0000000000000000000008 = {isa = PBXBuildFile; fileRef = BD0000000000000000000008; };
 		AD0000000000000000000009 = {isa = PBXBuildFile; fileRef = BD0000000000000000000009; };
@@ -74,7 +72,6 @@
 		A1E2E000000000000000000B /* AirSIMNotificationService.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = B1E2E000000000000000000A /* AirSIMNotificationService.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		A10000000000000000000008 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000008 /* RootView.swift */; };
 		A10000000000000000000009 /* PhoneViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000009 /* PhoneViews.swift */; };
-		A9EA70000000000000000001 /* SystemCallHistory.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9EA70000000000000000001 /* SystemCallHistory.swift */; };
 		A1000000000000000000000A /* AirSIMSetupView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B1000000000000000000000A /* AirSIMSetupView.swift */; };
 		A1000000000000000000000E /* CallKitController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000010 /* CallKitController.swift */; };
 		A1000000000000000000000F /* WiredHTTPTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000011 /* WiredHTTPTransport.swift */; };
@@ -212,10 +209,8 @@
         B732C0C0F49F510FB6E3C928 /* IPhoneMailbox.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPhoneMailbox.swift; sourceTree = "<group>"; };
         B7C0A1000000000000000001 /* PhoneNavigationPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneNavigationPolicy.swift; sourceTree = "<group>"; };
         B1CE11000000000000000001 /* IPhoneCellularDialer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPhoneCellularDialer.swift; sourceTree = "<group>"; };
-        B1CE11000000000000000002 /* IPhoneCarrierMessaging.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPhoneCarrierMessaging.swift; sourceTree = "<group>"; };
         B5C0A1000000000000000002 /* SMSConversationTimelineView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SMSConversationTimelineView.swift; sourceTree = "<group>"; };
         B5C0A1000000000000000003 /* SMSConversationPresentationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SMSConversationPresentationTests.swift; sourceTree = "<group>"; };
-        B1CE11000000000000000003 /* IPhoneMMSGroupTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IPhoneMMSGroupTests.swift; sourceTree = "<group>"; };
         B5C0A1000000000000000004 /* SMSConversationInteractionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SMSConversationInteractionTests.swift; sourceTree = "<group>"; };
 		BD0000000000000000000008 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceCallActionRouter.swift; sourceTree = "<group>"; };
 		BD0000000000000000000009 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceCallActionRouterTests.swift; sourceTree = "<group>"; };
@@ -246,7 +241,6 @@
 		B1E2E000000000000000000A /* AirSIMNotificationService.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = AirSIMNotificationService.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		B10000000000000000000008 /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
 		B10000000000000000000009 /* PhoneViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneViews.swift; sourceTree = "<group>"; };
-		B9EA70000000000000000001 /* SystemCallHistory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemCallHistory.swift; sourceTree = "<group>"; };
 		B1000000000000000000000A /* AirSIMSetupView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AirSIMSetupView.swift; sourceTree = "<group>"; };
 		B1000000000000000000000B /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B1000000000000000000000C /* AirSIM.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AirSIM.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -412,7 +406,6 @@
 				B1000000000000000000001D /* WatchCallCoordinator.swift */,
 				B10000000000000000000008 /* RootView.swift */,
 				B10000000000000000000009 /* PhoneViews.swift */,
-				B9EA70000000000000000001 /* SystemCallHistory.swift */,
                 BF1870000000000000000001,
                 BF1870000000000000000002,
                 B5C0A1000000000000000001 /* SMSConversationPresentation.swift */,
@@ -422,7 +415,6 @@
                 B732C0C0F49F510FB6E3C928 /* IPhoneMailbox.swift */,
                 B7C0A1000000000000000001 /* PhoneNavigationPolicy.swift */,
                 B1CE11000000000000000001 /* IPhoneCellularDialer.swift */,
-                B1CE11000000000000000002 /* IPhoneCarrierMessaging.swift */,
                 B5C0A1000000000000000002 /* SMSConversationTimelineView.swift */,
 				B1000000000000000000000A /* AirSIMSetupView.swift */,
 				B10000000000000000000018 /* LocalHistoryStore.swift */,
@@ -478,7 +470,6 @@
                 BE1000000000000000000003,
                 BE1100000000000000000002,
                 B5C0A1000000000000000003 /* SMSConversationPresentationTests.swift */,
-                B1CE11000000000000000003 /* IPhoneMMSGroupTests.swift */,
                 B5C0A1000000000000000004 /* SMSConversationInteractionTests.swift */,
 				BD0000000000000000000002 /* DeviceCallRegistryTests.swift */,
 				BD0000000000000000000005,
@@ -712,7 +703,6 @@
 				AD000000000000000000000B,
 				A10000000000000000000008 /* RootView.swift in Sources */,
 				A10000000000000000000009 /* PhoneViews.swift in Sources */,
-				A9EA70000000000000000001 /* SystemCallHistory.swift in Sources */,
                 AF1870000000000000000001,
                 A5C0A1000000000000000001 /* SMSConversationPresentation.swift in Sources */,
                 AB7039D7E0BDFA781D79BA39 /* IPhoneIntegrationDiagnostics.swift in Sources */,
@@ -721,7 +711,6 @@
                 A732C0C0F49F510FB6E3C928 /* IPhoneMailbox.swift in Sources */,
                 A7C0A1000000000000000001 /* PhoneNavigationPolicy.swift in Sources */,
                 A1CE11000000000000000001 /* IPhoneCellularDialer.swift in Sources */,
-                A1CE11000000000000000002 /* IPhoneCarrierMessaging.swift in Sources */,
                 A5C0A1000000000000000002 /* SMSConversationTimelineView.swift in Sources */,
 				A1000000000000000000000A /* AirSIMSetupView.swift in Sources */,
 				A1000000000000000000000E /* CallKitController.swift in Sources */,
@@ -788,7 +777,6 @@
                 AE1000000000000000000003,
                 AE1100000000000000000002,
                 A5C0A1000000000000000003 /* SMSConversationPresentationTests.swift in Sources */,
-                A1CE11000000000000000003 /* IPhoneMMSGroupTests.swift in Sources */,
                 A5C0A1000000000000000004 /* SMSConversationInteractionTests.swift in Sources */,
 				AD0000000000000000000002 /* DeviceCallRegistryTests.swift in Sources */,
 				AD0000000000000000000005,
@@ -839,8 +827,8 @@
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
-		F2E2E0000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {APPLICATION_EXTENSION_API_ONLY = YES; CODE_SIGN_ENTITLEMENTS = AirSIMNotificationService/AirSIMNotificationService.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 196; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = AirSIMNotificationService/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 16.3; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", ); MARKETING_VERSION = 0.9.9; PRODUCT_BUNDLE_IDENTIFIER = com.heroxhs.airsim.notificationservice; PRODUCT_NAME = AirSIMNotificationService; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
-		F2E2E0000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {APPLICATION_EXTENSION_API_ONLY = YES; CODE_SIGN_ENTITLEMENTS = AirSIMNotificationService/AirSIMNotificationService.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 196; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = AirSIMNotificationService/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 16.3; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", ); MARKETING_VERSION = 0.9.9; PRODUCT_BUNDLE_IDENTIFIER = com.heroxhs.airsim.notificationservice; PRODUCT_NAME = AirSIMNotificationService; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		F2E2E0000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = {APPLICATION_EXTENSION_API_ONLY = YES; CODE_SIGN_ENTITLEMENTS = AirSIMNotificationService/AirSIMNotificationService.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 197; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = AirSIMNotificationService/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 16.3; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", ); MARKETING_VERSION = 0.9.9; PRODUCT_BUNDLE_IDENTIFIER = com.heroxhs.airsim.notificationservice; PRODUCT_NAME = AirSIMNotificationService; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		F2E2E0000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = {APPLICATION_EXTENSION_API_ONLY = YES; CODE_SIGN_ENTITLEMENTS = AirSIMNotificationService/AirSIMNotificationService.entitlements; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 197; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = AirSIMNotificationService/Info.plist; IPHONEOS_DEPLOYMENT_TARGET = 16.3; LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", ); MARKETING_VERSION = 0.9.9; PRODUCT_BUNDLE_IDENTIFIER = com.heroxhs.airsim.notificationservice; PRODUCT_NAME = AirSIMNotificationService; SKIP_INSTALL = YES; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
         FE2000000000000000000002 = {isa = XCBuildConfiguration; name = Debug; buildSettings = {
             GENERATE_INFOPLIST_FILE = YES; PRODUCT_BUNDLE_IDENTIFIER = com.heroxhs.airsim.uitests;
             PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 5.0; IPHONEOS_DEPLOYMENT_TARGET = 16.3;
@@ -888,11 +876,11 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = "$(AIRSIM_PUSH_ENTITLEMENTS)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 196;
+				CURRENT_PROJECT_VERSION = 197;
 				DEVELOPMENT_TEAM = "";
 				AIRSIM_APNS_ENVIRONMENT = sandbox;
 				AIRSIM_PUSH_ENTITLEMENTS = "AirSIM/AirSIM.entitlements";
-				OTHER_LDFLAGS = ("$(inherited)", "-weak_framework", LiveCommunicationKit, "-weak_framework", TelephonyMessagingKit, );
+				OTHER_LDFLAGS = ("$(inherited)", "-weak_framework", LiveCommunicationKit, );
 				AIRSIM_PUSH_RELAY_URL = "";
 				AIRSIM_WIDEBAND_TRIAL_AGENT_ID = "";
 				GENERATE_INFOPLIST_FILE = NO;
@@ -916,11 +904,11 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = "$(AIRSIM_PUSH_ENTITLEMENTS)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 196;
+				CURRENT_PROJECT_VERSION = 197;
 				DEVELOPMENT_TEAM = "";
 				AIRSIM_APNS_ENVIRONMENT = production;
 				AIRSIM_PUSH_ENTITLEMENTS = "AirSIM/AirSIM.entitlements";
-				OTHER_LDFLAGS = ("$(inherited)", "-weak_framework", LiveCommunicationKit, "-weak_framework", TelephonyMessagingKit, );
+				OTHER_LDFLAGS = ("$(inherited)", "-weak_framework", LiveCommunicationKit, );
 				AIRSIM_PUSH_RELAY_URL = "";
 				AIRSIM_WIDEBAND_TRIAL_AGENT_ID = "";
 				GENERATE_INFOPLIST_FILE = NO;
@@ -943,7 +931,7 @@
                 CODE_SIGN_ENTITLEMENTS = AirSIMLiveActivityExtension/AirSIMWidgets.entitlements;
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 196;
+				CURRENT_PROJECT_VERSION = 197;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = AirSIMLiveActivityExtension/Info.plist;
@@ -970,7 +958,7 @@
                 CODE_SIGN_ENTITLEMENTS = AirSIMLiveActivityExtension/AirSIMWidgets.entitlements;
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 196;
+				CURRENT_PROJECT_VERSION = 197;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = AirSIMLiveActivityExtension/Info.plist;
@@ -1030,7 +1018,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = "AirSIMWatchApp/AirSIMWatchApp.entitlements";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 196;
+				CURRENT_PROJECT_VERSION = 197;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -1059,7 +1047,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = "AirSIMWatchApp/AirSIMWatchApp.entitlements";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 196;
+				CURRENT_PROJECT_VERSION = 197;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = "AirSIMWatchApp/Info.plist";

@@ -1,17 +1,17 @@
-name: Build public unsigned AirSIM iOS 196
+name: Build public unsigned AirSIM iOS 197
 on:
   workflow_dispatch:
   push:
     branches: [main, feature/ios-195-carrier]
     paths:
       - 'ios-client/iOS/**'
-      - '.github/workflows/build-ios-196.yml'
+      - '.github/workflows/build-ios-197.yml'
 
 permissions:
   contents: write
 
 concurrency:
-  group: public-ios-196
+  group: public-ios-197
   cancel-in-progress: true
 
 jobs:
@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 50
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
-      IPA: AirSIM-iOS-0.9.9-build196-Sandbox-full-unsigned.ipa
+      IPA: AirSIM-iOS-0.9.9-build197-Sandbox-full-unsigned.ipa
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
       - name: Compile iPhone, extensions and Watch
@@ -32,7 +32,7 @@ jobs:
           xcrun --sdk watchos --show-sdk-version
           xcodebuild -project ios-client/iOS/AirSIM.xcodeproj -scheme AirSIM -configuration Release \
             -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/AirSIM.xcarchive" \
-            MARKETING_VERSION=0.9.9 CURRENT_PROJECT_VERSION=196 \
+            MARKETING_VERSION=0.9.9 CURRENT_PROJECT_VERSION=197 \
             APS_ENVIRONMENT=development AIRSIM_APNS_ENVIRONMENT=sandbox AIRSIM_PUSH_RELAY_URL= AIRSIM_WIDEBAND_TRIAL_AGENT_ID= \
             CODE_SIGNING_ALLOWED=NO archive
           sh ios-client/iOS/scripts/package-unsigned.sh "$RUNNER_TEMP/AirSIM.xcarchive" "$RUNNER_TEMP/$IPA" full
@@ -40,9 +40,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir "$RUNNER_TEMP/ios196-check"
-          ditto -xk "$RUNNER_TEMP/$IPA" "$RUNNER_TEMP/ios196-check"
-          cd "$RUNNER_TEMP/ios196-check"
+          mkdir "$RUNNER_TEMP/ios197-check"
+          ditto -xk "$RUNNER_TEMP/$IPA" "$RUNNER_TEMP/ios197-check"
+          cd "$RUNNER_TEMP/ios197-check"
           main=Payload/AirSIM.app
           python3 - <<'PY'
           from pathlib import Path
@@ -53,7 +53,7 @@ jobs:
           assert {f.parent for f in app.rglob('Info.plist') if f.parent.suffix in ('.app','.appex')} == components
           for bundle in components:
               info = plistlib.loads((bundle/'Info.plist').read_bytes())
-              assert info['CFBundleVersion'] == '196' and info['CFBundleShortVersionString'] == '0.9.9'
+              assert info['CFBundleVersion'] == '197' and info['CFBundleShortVersionString'] == '0.9.9'
               assert (bundle / info['CFBundleExecutable']).is_file()
               if bundle == app:
                   assert info['AirSIMAPNSEnvironment'] == 'sandbox'
@@ -66,8 +66,8 @@ jobs:
             kind=$(file -b "$file")
             case "$kind" in *Mach-O*) ;; *) continue ;; esac
             count=$((count+1))
-            xcrun otool -arch all -l "$file" > "$RUNNER_TEMP/ios196-load-commands"
-            if grep -q 'cmd LC_CODE_SIGNATURE' "$RUNNER_TEMP/ios196-load-commands"; then
+            xcrun otool -arch all -l "$file" > "$RUNNER_TEMP/ios197-load-commands"
+            if grep -q 'cmd LC_CODE_SIGNATURE' "$RUNNER_TEMP/ios197-load-commands"; then
               echo "::error::Signed Mach-O in $file"
               exit 1
             fi
@@ -77,15 +77,15 @@ jobs:
           python3 - "$RUNNER_TEMP/main-loads" <<'PYCODE'
           import re, sys
           data = open(sys.argv[1]).read()
-          for name in ('LiveCommunicationKit', 'TelephonyMessagingKit'):
-              assert any('cmd LC_LOAD_WEAK_DYLIB' in part and '/'+name+'.framework/' in part for part in re.split(r'Load command \d+\n', data)), name
+          assert any('cmd LC_LOAD_WEAK_DYLIB' in part and '/LiveCommunicationKit.framework/' in part for part in re.split(r'Load command \d+\n', data))
+          assert '/TelephonyMessagingKit.framework/' not in data
           PYCODE
           shasum -a 256 "$RUNNER_TEMP/$IPA"
       - name: Retain a downloadable copy of the verified IPA
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         continue-on-error: true
         with:
-          name: AirSIM-iOS-196-unsigned
+          name: AirSIM-iOS-197-unsigned
           path: ${{ runner.temp }}/${{ env.IPA }}
           compression-level: 0
           if-no-files-found: error
@@ -101,7 +101,7 @@ jobs:
           if ! git diff --cached --quiet; then
             git config user.name 'github-actions[bot]'
             git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git commit -m 'Publish verified unsigned iOS 0.9.9 (196) Sandbox build'
+            git commit -m 'Publish verified unsigned iOS 0.9.9 (197) Sandbox build'
             git push origin "HEAD:$GITHUB_REF_NAME"
           fi
   carrier-tests:
@@ -121,4 +121,5 @@ jobs:
           xcodebuild test -project ios-client/iOS/AirSIM.xcodeproj -scheme AirSIM \
             -destination "platform=iOS Simulator,id=$device" -parallel-testing-enabled NO \
             -only-testing:AirSIMTests/CallbackSIMDialChoiceTests -only-testing:AirSIMTests/ExternalDialHandoffTests \
-            -only-testing:AirSIMTests/SystemCallHistoryTests -only-testing:AirSIMTests/IPhoneMailboxTests -only-testing:AirSIMTests/IPhoneMMSGroupTests
+            -only-testing:AirSIMTests/HistoricalCallDialTests -only-testing:AirSIMTests/IPhoneMailboxTests -only-testing:AirSIMTests/IPhoneSigningDiagnosticsTests \
+            -only-testing:AirSIMTests/RelayEgressGateTests -only-testing:AirSIMTests/SMSConversationPresentationTests -only-testing:AirSIMTests/DeviceCallActionRouterTests

@@ -5,9 +5,7 @@ import Foundation
 enum IPhoneSigningDiagnostics {
     private static let names = [
         ("默认通话", "calling-app"),
-        ("默认拨号", "dialing-app"),
-        ("默认消息", "messaging-app"),
-        ("默认运营商消息", "carrier-messaging-app")
+        ("默认拨号", "dialing-app")
     ]
     private static let prefix = "com.apple.developer."
     private static let fieldLimit = 4 * 1024 * 1024

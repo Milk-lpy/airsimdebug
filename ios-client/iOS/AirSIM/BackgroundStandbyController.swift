@@ -125,17 +125,12 @@ final class AirSIMNotificationDelegate: NSObject, UIApplicationDelegate, @precon
     }
     private let historyStore = LocalHistoryStore()
 
-    func applicationProtectedDataDidBecomeAvailable(_ application: UIApplication) {
-        IPhoneCarrierMessaging.shared.refresh()
-    }
-
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         let center = UNUserNotificationCenter.current()
         center.delegate = self
-        IPhoneCarrierMessaging.shared.refresh()
         IncomingCallNotification.registerCategory()
         CrashDiagnosticsStore.shared.start()
         let policy = ConnectionModeRuntimePolicy(mode: ConnectionModePreference.selected())

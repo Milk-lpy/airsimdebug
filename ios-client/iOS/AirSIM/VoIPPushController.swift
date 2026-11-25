@@ -37,7 +37,7 @@ struct IncomingVoIPCall: Equatable, Sendable {
     let ttsText: String?
     /// 公网 PCM 仅作为 VoWLAN 控制链路不可用时的回退。完整带签名地址只保存在内存中。
     let authenticatedMediaURL: URL?
-    let requestedMediaTransport: CloudMediaTransport
+    let supportsCloudPCM: Bool
 
     init(userInfo: [AnyHashable: Any], now: Date = Date()) throws {
         guard userInfo["event"] as? String == "incoming_call" else {
@@ -75,9 +75,7 @@ struct IncomingVoIPCall: Equatable, Sendable {
             ttsText = nil
         }
         authenticatedMediaURL = Self.authenticatedMediaURL(from: userInfo, uuid: uuid)
-        requestedMediaTransport = CloudMediaTransport(
-            rawValue: Self.nonEmpty(userInfo["media_transport"] as? String) ?? ""
-        ) ?? .legacyPCM
+        supportsCloudPCM = HomeRelayWirePolicy.permitsPCM(userInfo["media_transport"])
     }
 
     init(
@@ -87,7 +85,7 @@ struct IncomingVoIPCall: Equatable, Sendable {
         secret: String,
         mediaURL: URL,
         generation: UInt64 = 1,
-        mediaTransport: CloudMediaTransport = .legacyPCM,
+        assignedTransport: String? = nil,
         agentID: String? = nil
     ) throws {
         guard !outgoingCallID.isEmpty, secret.count >= 24,
@@ -113,7 +111,7 @@ struct IncomingVoIPCall: Equatable, Sendable {
         isOutgoing = true
         ttsText = nil
         authenticatedMediaURL = authenticatedURL
-        requestedMediaTransport = mediaTransport
+        supportsCloudPCM = HomeRelayWirePolicy.permitsPCM(assignedTransport)
     }
 
     init(
@@ -134,7 +132,7 @@ struct IncomingVoIPCall: Equatable, Sendable {
         isOutgoing = false
         ttsText = nil
         authenticatedMediaURL = nil
-        requestedMediaTransport = .legacyPCM
+        supportsCloudPCM = false
     }
 
     func matches(backendID: String?, uuid: UUID?) -> Bool {
@@ -667,7 +665,7 @@ private struct CloudCommandEnqueueResponse: Decodable {
         let generation: UInt64?
         let callSecret: String
         let mediaURL: String
-        let mediaTransport: CloudMediaTransport?
+        let mediaTransport: String?
         enum CodingKeys: String, CodingKey {
             case callID = "call_id"
             case agentID = "agent_id"
@@ -1592,6 +1590,20 @@ final class VoIPPushController: NSObject {
               let mediaURL = URL(string: call.mediaURL) else {
             throw CloudCommandError.invalidResponse
         }
+        let outgoing = try IncomingVoIPCall(
+            outgoingCallID: call.callID,
+            uuid: uuid,
+            number: number,
+            secret: call.callSecret,
+            mediaURL: mediaURL,
+            generation: call.generation ?? 1,
+            assignedTransport: call.mediaTransport,
+            agentID: call.agentID
+        )
+        guard outgoing.supportsCloudPCM else {
+            IPhoneCloudCallSession.shared.endUnadoptedOutgoing(outgoing)
+            throw IPhoneCloudCallError.unsupportedTransport
+        }
         // The enqueue response already contains the authenticated call/media
         // identity. Android dials the cellular call immediately; waiting for the
         // command-result KV write used to consume the whole CallKit start window.
@@ -1608,16 +1620,7 @@ final class VoIPPushController: NSObject {
            outcome.result?.dialing != true {
             throw CloudCommandError.failed(outcome.error ?? "模块未能开始拨号")
         }
-        return try IncomingVoIPCall(
-            outgoingCallID: call.callID,
-            uuid: uuid,
-            number: number,
-            secret: call.callSecret,
-            mediaURL: mediaURL,
-            generation: call.generation ?? 1,
-            mediaTransport: call.mediaTransport ?? .legacyPCM,
-            agentID: call.agentID
-        )
+        return outgoing
     }
 
     func sendCloudSMS(to number: String, message: String, target: CloudCommandTarget,
@@ -1939,7 +1942,7 @@ final class VoIPPushController: NSObject {
             bundleID: Bundle.main.bundleIdentifier ?? "com.example.airsim",
             environment: APNsEnvironment.current,
             relayURL: relayURL,
-            mediaTransport: CloudMediaTransportPreference.requested().rawValue,
+            mediaTransport: CloudMediaTransport.legacyPCM.rawValue,
             appMediaCapabilities: [CloudMediaTransport.legacyPCM.rawValue],
             forceLegacyPCM: CloudMediaTransportPreference.forceLegacy(),
             vowlanSecret: nil,

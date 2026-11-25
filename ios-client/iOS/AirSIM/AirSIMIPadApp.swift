@@ -80,7 +80,6 @@ struct AirSIMIPadApp: App {
             guard uiTestDefaults == nil else { return }
             switch phase {
             case .active:
-                IPhoneCarrierMessaging.shared.refresh(retryNow: true)
                 model.didBecomeActive()
             case .inactive:
                 // 必须在真正进入后台前启动音频会话；等到 .background 才启动时，
