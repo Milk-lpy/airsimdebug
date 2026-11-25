@@ -37,7 +37,7 @@ struct IPhoneHistoryImportButton: View {
                     migration = nil
                     do {
                         let (messages, calls) = try IPhoneMailbox.shared.merge(archive)
-                        message = "已新增 \(messages) 条消息、\(calls) 条通话。重复记录已跳过。"
+                        message = "已新增 \(messages) 条消息、\(calls) 条通话，已导入 \(IPhoneMailbox.shared.lastImportAttachmentCount) 个附件。重复记录已跳过。"
                     } catch { message = error.localizedDescription }
                 }
                 Button("取消", role: .cancel) { migration = nil }
@@ -168,10 +168,10 @@ private struct IPhoneCarrierThread: View {
     private func send(_ record: IPhoneCarrierRecord) {
         guard !sending, record.importedThread == nil else { return }
         sending = true
-        let encrypted = messages.contains { $0.requiresEncryptedReply }
         Task {
             defer { sending = false }
             do {
+                let encrypted = try box.requiresEncryptedReplies(thread: record.threadID)
                 try await carrier.send(draft, to: record.peer, lineID: record.lineID, kind: record.kind,
                     groupID: record.groupID, attachments: attachment.map { [$0] } ?? [], encrypted: encrypted)
                 draft = ""; attachment = nil

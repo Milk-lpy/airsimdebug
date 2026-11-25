@@ -60,6 +60,7 @@ final class IPhoneMailbox: ObservableObject {
     static let shared = IPhoneMailbox()
     @Published private(set) var revision = 0
     @Published private(set) var importedCalls: [CallRecord] = []
+    private(set) var lastImportAttachmentCount = 0
     @Published var presented: IPhoneMailboxRoute?
     @Published var lastError: String?
     private var database: OpaquePointer?
@@ -90,6 +91,7 @@ final class IPhoneMailbox: ObservableObject {
         CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, thread TEXT NOT NULL, date REAL NOT NULL, unread INTEGER NOT NULL, meta BLOB NOT NULL);
         CREATE INDEX IF NOT EXISTS message_order ON messages(thread,date DESC,id DESC);
         CREATE TABLE IF NOT EXISTS parts (message TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE, pos INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(message,pos));
+        CREATE TABLE IF NOT EXISTS encrypted_threads (thread TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS calls (id TEXT PRIMARY KEY, date REAL NOT NULL, data BLOB NOT NULL);
         """
         guard sqlite3_exec(handle, schema, nil, nil, nil) == SQLITE_OK else {
@@ -161,9 +163,19 @@ final class IPhoneMailbox: ObservableObject {
         let inserted = try execute("INSERT INTO messages VALUES (?,?,?,?,?) ON CONFLICT(id) DO NOTHING", [
             .string(item.id), .string(item.threadID), .number(item.date.timeIntervalSince1970),
             .number(unread ? 1 : 0), .blob(try metadata(item))])
-        if inserted > 0 { try addParts(item.id, item.attachments) }
+        if inserted > 0 {
+            try addParts(item.id, item.attachments)
+            if item.requiresEncryptedReply {
+                try execute("INSERT OR IGNORE INTO encrypted_threads VALUES (?)", [.string(item.threadID)])
+            }
+        }
         return inserted > 0
     }
+    /// Test the same write lock and file protection as a message insert before draining carrier queues.
+    func requireWritable() throws {
+        try transaction { }
+    }
+
     @discardableResult func insert(_ message: IPhoneCarrierRecord) throws -> Bool {
         let added = try transaction { try add(message, unread: !message.outgoing) }
         if added { revision &+= 1 }; return added
@@ -173,7 +185,7 @@ final class IPhoneMailbox: ObservableObject {
     }
     func updateStatus(id: String, to status: String) throws {
         guard var item = try record(id: id), item.status != status else { return }
-        let order = ["发送中": 0, "发送未确认": 1, "已发送": 2, "已送达": 3, "已读": 4]
+        let order = ["发送中": 0, "发送未确认": 1, "已发送": 2, "投递异常": 3, "已送达": 4, "已读": 5]
         if let old = order[item.status], let next = order[status], next < old { return }
         if item.status == "已读" || (item.status == "已送达" && order[status] == nil) { return }
         item.status = status
@@ -224,6 +236,9 @@ final class IPhoneMailbox: ObservableObject {
         try rows("SELECT meta FROM messages WHERE thread=? ORDER BY date DESC,id DESC LIMIT ?",
                  [.string(thread), .number(Double(limit))]).reversed().map { try decoder.decode(IPhoneCarrierRecord.self, from: $0) }
     }
+    func requiresEncryptedReplies(thread: String) throws -> Bool {
+        try !rows("SELECT CAST(thread AS BLOB) FROM encrypted_threads WHERE thread=?", [.string(thread)]).isEmpty
+    }
     func markRead(thread: String) throws {
         if try execute("UPDATE messages SET unread=0 WHERE thread=? AND unread=1", [.string(thread)]) > 0 { revision &+= 1 }
     }
@@ -231,7 +246,11 @@ final class IPhoneMailbox: ObservableObject {
         Set(try rows("SELECT DISTINCT CAST(thread AS BLOB) FROM messages WHERE unread=1").map { String(decoding: $0, as: UTF8.self) })
     }
     func remove(thread: String) throws {
-        try execute("DELETE FROM messages WHERE thread=?", [.string(thread)]); revision &+= 1
+        try transaction {
+            try execute("DELETE FROM messages WHERE thread=?", [.string(thread)])
+            try execute("DELETE FROM encrypted_threads WHERE thread=?", [.string(thread)])
+        }
+        revision &+= 1
     }
     func openNotification(id: String) {
         do { if let item = try record(id: id) { presented = .init(id: item.threadID) } }
@@ -254,6 +273,7 @@ final class IPhoneMailbox: ObservableObject {
             let timestamp: Double
             let readOnly: Bool
             let peer, sender, line: String?
+            var attachments: [IPhoneCarrierAttachment]? = nil
         }
         struct Call: Decodable {
             let id, direction, service: String
@@ -282,28 +302,49 @@ final class IPhoneMailbox: ObservableObject {
             return Date(timeIntervalSince1970: seconds)
         }
         var counts = (0, 0)
+        var addedParts = 0
         try transaction {
             for entry in archive.messages {
                 guard validID(entry.id), !entry.threadID.isEmpty, entry.readOnly,
                       ["outgoing","incoming"].contains(entry.direction) else { throw IPhoneMailboxError.invalidImport }
+                let importedParts = entry.attachments ?? []
+                guard importedParts.allSatisfy({ $0.data.count <= 32 * 1024 * 1024 }) else { throw IPhoneMailboxError.tooLarge }
                 let record = IPhoneCarrierRecord(id: "iphone-import:" + entry.id, lineID: entry.line ?? "", lineLabel: entry.line ?? "",
                     peer: entry.peer ?? entry.sender ?? entry.title, kind: entry.service, body: entry.text, date: try date(entry.timestamp),
-                    outgoing: entry.direction == "outgoing", importedThread: entry.threadID, importedTitle: entry.title)
-                if try add(record, unread: false) { counts.0 += 1 }
+                    outgoing: entry.direction == "outgoing", attachments: importedParts, importedThread: entry.threadID, importedTitle: entry.title)
+                if try add(record, unread: false) {
+                    counts.0 += 1
+                    addedParts += importedParts.count
+                } else if !importedParts.isEmpty, var previous = try self.record(id: record.id), previous.threadID == record.threadID {
+                    // An earlier import may have contained only the text. Enrich that record without duplicating it.
+                    for part in importedParts {
+                        let exists = try previous.attachments.enumerated().contains { i, old in
+                            guard old.name == part.name, old.mimeType == part.mimeType else { return false }
+                            return try attachment(id: previous.id, index: i) == part.data
+                        }
+                        if !exists {
+                            try execute("INSERT INTO parts VALUES (?,?,?)", [.string(previous.id), .number(Double(previous.attachments.count)), .blob(part.data)])
+                            previous.attachments.append(part)
+                            addedParts += 1
+                        }
+                    }
+                    try execute("UPDATE messages SET meta=? WHERE id=?", [.blob(try metadata(previous)), .string(previous.id)])
+                }
             }
             for entry in archive.calls {
                 guard validID(entry.id), ["outgoing","incoming","unknown"].contains(entry.direction) else { throw IPhoneMailboxError.invalidImport }
                 let start = try date(entry.timestamp)
                 let duration = entry.duration.flatMap { $0.isFinite && $0 >= 0 && $0 < 31_536_000 ? $0 : nil }
-                let end = duration.map { start.addingTimeInterval($0) }
                 let record = CallRecord(id: "iphone-import:" + entry.id, index: 0, direction: entry.direction, state: "ended", number: entry.number,
-                    startedAt: start, updatedAt: end ?? start, endedAt: end, missed: entry.direction == "incoming" && entry.answered == false,
-                    sourceCallID: entry.systemID.flatMap { UUID(uuidString: $0)?.uuidString })
+                    startedAt: start, updatedAt: start, endedAt: nil, missed: entry.direction == "incoming" && entry.answered == false,
+                    sourceCallID: entry.systemID.flatMap { UUID(uuidString: $0)?.uuidString },
+                    importedDetails: .init(service: entry.service, line: entry.line, answered: entry.answered, duration: duration))
                 counts.1 += Int(try execute("INSERT INTO calls VALUES (?,?,?) ON CONFLICT(id) DO NOTHING",
                     [.string(record.id), .number(entry.timestamp), .blob(try encoder.encode(record))]))
             }
         }
         try reloadCalls(); revision &+= 1
+        lastImportAttachmentCount = addedParts
         return counts
     }
 }

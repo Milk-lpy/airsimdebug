@@ -424,6 +424,12 @@ final class SystemCallHistoryTests: XCTestCase {
         XCTAssertEqual(SystemCallEntry.combinedRecords(android: [], imported: [copy], system: []).first?.id, copy.id)
     }
 
+    func testImportedFaceTimeEmailIsNotTreatedAsAnAndroidDialTarget() {
+        XCTAssertNil(RecentCallDialPolicy.numberToDial("name@example.invalid", imported: true))
+        XCTAssertEqual(RecentCallDialPolicy.numberToDial("tel:%2B1%20555-0100", imported: true), "+15550100")
+        XCTAssertEqual(RecentCallDialPolicy.numberToDial("555 0100", imported: true), "5550100")
+    }
+
     func testGroupCallDoesNotPreselectOneParticipant() {
         let group = SystemCallEntry(id: UUID(), date: Date(), direction: "incoming", status: "未接来电",
                                     missed: true, duration: nil, participants: [
@@ -485,7 +491,7 @@ final class IPhoneMailboxTests: XCTestCase {
             peer: "5550100", sender: nil, line: "line-one")
         func call(_ id: String) -> IPhoneMailbox.Migration.Call {
             .init(id: id, direction: "incoming", service: "cellular", timestamp: 90,
-                  number: "5550100", line: nil, systemID: nil, duration: nil, answered: false)
+                  number: "5550100", line: "line-two", systemID: nil, duration: 0, answered: false)
         }
         func archive(_ id: String) -> IPhoneMailbox.Migration {
             .init(format: "airsim-iphone-history", version: 1, messages: [msg], calls: [call(id)])
@@ -506,9 +512,32 @@ final class IPhoneMailboxTests: XCTestCase {
         XCTAssertFalse(try box.unreadThreads().contains(imported.threadID))
         XCTAssertEqual(box.importedCalls.map(\.id), ["iphone-import:" + callID])
         XCTAssertEqual(box.importedCalls.first?.missed, true)
+        XCTAssertEqual(box.importedCalls.first?.importedDetails,
+                       ImportedCallDetails(service: "cellular", line: "line-two", answered: false, duration: 0))
+        XCTAssertNil(box.importedCalls.first?.connectedAt)
+        XCTAssertNil(box.importedCalls.first?.endedAt)
         try box.removeImportedCall(id: "iphone-import:" + callID)
         XCTAssertTrue(box.importedCalls.isEmpty)
         XCTAssertEqual(try box.messages(thread: live.threadID, limit: 10).count, 1)
+    }
+
+    @MainActor func testImportAddsMissingMediaOnce() throws {
+        let box = IPhoneMailbox(directory: try directory())
+        let id = String(repeating: "d", count: 64)
+        var msg = IPhoneMailbox.Migration.Message(id: id, threadID: "backup-thread", title: "Test", direction: "incoming",
+            service: "iMessage", text: "[附件]", timestamp: 100, readOnly: true, peer: nil, sender: nil, line: nil)
+        func load() throws {
+            _ = try box.merge(.init(format: "airsim-iphone-history", version: 1, messages: [msg], calls: []))
+        }
+        try load()
+        msg.attachments = [.init(name: "one.txt", mimeType: "text/plain", data: Data([65,66]))]
+        try load()
+        XCTAssertEqual(box.lastImportAttachmentCount, 1)
+        try load()
+        XCTAssertEqual(box.lastImportAttachmentCount, 0)
+        let thread = try XCTUnwrap(try box.latestThreads().first)
+        XCTAssertEqual(thread.attachments.count, 1)
+        XCTAssertEqual(try box.attachment(id: thread.id, index: 0), Data([65,66]))
     }
 
     @MainActor func testExclusiveDatabaseLockCannotReplaceMessagesWithEmptyStorage() throws {
@@ -520,9 +549,11 @@ final class IPhoneMailboxTests: XCTestCase {
                                        SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
         defer { sqlite3_close(lock) }
         XCTAssertEqual(sqlite3_exec(lock, "BEGIN EXCLUSIVE", nil, nil, nil), SQLITE_OK)
+        XCTAssertThrowsError(try original.requireWritable())
         XCTAssertThrowsError(try original.insert(message("during")))
         XCTAssertEqual(sqlite3_exec(lock, "ROLLBACK", nil, nil, nil), SQLITE_OK)
         let reopened = IPhoneMailbox(directory: location)
+        XCTAssertNoThrow(try reopened.requireWritable())
         XCTAssertEqual(try reopened.latestThreads().map(\.id), ["before"])
         XCTAssertTrue(try reopened.insert(message("after", line: "line-two")))
         XCTAssertEqual(Set(try reopened.latestThreads().map(\.id)), Set(["before", "after"]))

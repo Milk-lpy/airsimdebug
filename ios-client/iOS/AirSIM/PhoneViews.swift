@@ -107,9 +107,12 @@ enum RecentCallTimeFormatter {
 }
 
 enum RecentCallDialPolicy {
-    static func numberToDial(_ number: String?) -> String? {
+    static func numberToDial(_ number: String?, imported: Bool = false) -> String? {
         guard let number, !number.isEmpty else { return nil }
-        return number
+        guard imported else { return number }
+        if number.lowercased().hasPrefix("tel:"), let url = URL(string: number),
+           case let .call(value)? = SystemCommunicationURL.destination(for: url) { return value }
+        return SystemCommunicationURL.dialableNumber(from: number)
     }
 }
 
@@ -837,7 +840,11 @@ struct RecentsView: View {
     private func isImported(_ call: CallRecord) -> Bool { call.id.hasPrefix("iphone-import:") }
     private func source(_ call: CallRecord) -> String {
         if systemHistory.entries[call.id] != nil { return "iPhone 系统通话" }
-        if isImported(call) { return "iPhone 导入记录" }
+        if isImported(call) {
+            let service = call.importedDetails?.service
+            let label = service == "cellular" ? "蜂窝" : service
+            return ["iPhone 导入记录", label].compactMap { $0 }.filter { !$0.isEmpty && $0 != "unknown" }.joined(separator: " · ")
+        }
         return call.slotIndex.map { "安卓 SIM \($0 + 1)" } ?? "安卓网关"
     }
     private func title(_ call: CallRecord) -> String {
@@ -849,7 +856,21 @@ struct RecentsView: View {
             let direction = call.direction == "incoming" ? "呼入" : call.direction == "outgoing" ? "呼出" : ""
             return [direction, system.status].filter { !$0.isEmpty }.joined(separator: " · ")
         }
-        return call.missed ? "未接来电" : call.direction == "incoming" ? "呼入" : "呼出"
+        let direction = call.direction == "incoming" ? "呼入" : call.direction == "outgoing" ? "呼出" : "方向未知"
+        if call.missed { return "未接来电" }
+        if let details = call.importedDetails {
+            let answer = details.answered.map { $0 ? "已接通" : "未接通" } ?? "接通情况未知"
+            return direction + " · " + answer
+        }
+        return direction
+    }
+    private func directionIcon(_ call: CallRecord) -> String {
+        if call.missed { return "phone.badge.xmark" }
+        switch call.direction {
+        case "incoming": return "phone.arrow.down.left"
+        case "outgoing": return "phone.arrow.up.right"
+        default: return "phone"
+        }
     }
     private var groups: [RecentCallGroup] {
         RecentCallGroup.grouped(allRecords.filter { !missedOnly || ($0.direction == "incoming" && $0.missed) }).filter { group in
@@ -910,7 +931,7 @@ struct RecentsView: View {
                                         .accessibilityLabel(Text(group.latest.startedAt, style: .date))
                                 }
                                 HStack(spacing: 5) {
-                                    Image(systemName: group.latest.missed ? "phone.badge.xmark" : group.latest.direction == "incoming" ? "arrow.down.left" : "arrow.up.right")
+                                    Image(systemName: directionIcon(group.latest))
                                         .accessibilityHidden(true)
                                     Text([status(group.latest), source(group.latest)].joined(separator: " · "))
                                     if group.records.contains(where: { model.unseenMissedCallIDs.contains($0.id) }) {
@@ -1031,7 +1052,7 @@ struct RecentsView: View {
                                 }
                             }
                         }
-                        if let number = RecentCallDialPolicy.numberToDial(first.number) {
+                        if let number = RecentCallDialPolicy.numberToDial(first.number, imported: isImported(first)) {
                             HStack(spacing: 12) {
                                 Button { onCall(number) } label: { quickAction("呼出", "phone.fill") }
                                 Button { onMessage(number) } label: { quickAction("短信", "message.fill") }
@@ -1043,13 +1064,19 @@ struct RecentsView: View {
                 Section("通话时间轴") {
                     ForEach(records) { call in
                         HStack(alignment: .top, spacing: 14) {
-                            Image(systemName: call.missed ? "phone.badge.xmark" : call.direction == "incoming" ? "phone.arrow.down.left" : "phone.arrow.up.right")
+                            Image(systemName: directionIcon(call))
                                 .foregroundStyle(call.missed ? Color.red : Color.accentColor).frame(width: 30, height: 44)
                             VStack(alignment: .leading, spacing: 6) {
                                 Text(status(call)).font(.headline)
                                 Text(call.startedAt.formatted(date: .abbreviated, time: .standard)).foregroundStyle(.secondary)
                                 Label(source(call), systemImage: "simcard").font(.caption).foregroundStyle(.secondary)
+                                if let line = call.importedDetails?.line, !line.isEmpty {
+                                    Text("原记录线路 · " + line).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                                }
                                 if call.missed { Text("未接通").font(.caption).foregroundStyle(.red) }
+                                else if let duration = call.importedDetails?.duration {
+                                    Text("原记录时长 \(Int(duration) / 60) 分 \(Int(duration) % 60) 秒").font(.caption).foregroundStyle(.secondary)
+                                }
                                 else if let duration = systemHistory.entries[call.id]?.duration ?? call.connectedDuration { Text("通话时长 \(Int(duration) / 60) 分 \(Int(duration) % 60) 秒").font(.caption).foregroundStyle(.secondary) }
                                 else { Text("通话时长未记录").font(.caption).foregroundStyle(.secondary) }
                             }

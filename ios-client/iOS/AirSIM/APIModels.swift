@@ -21,6 +21,7 @@ struct CallRecord: Codable, Equatable, Sendable, Identifiable {
     var historyEstimated: Bool? = nil
     var slotIndex: Int? = nil
     var slotID: Int? = nil
+    var importedDetails: ImportedCallDetails? = nil
     var connectedDuration: TimeInterval? {
         guard !missed, let connectedAt, let endedAt, endedAt.timeIntervalSinceReferenceDate >= connectedAt.timeIntervalSinceReferenceDate else { return nil }
         return endedAt.timeIntervalSince(connectedAt)
@@ -36,6 +37,7 @@ struct CallRecord: Codable, Equatable, Sendable, Identifiable {
         case androidID = "android_id"
         case sourceAgentID = "source_agent_id", sourceCallID = "source_call_id"
         case historyEstimated = "history_estimated"
+        case importedDetails = "iphone_import_details"
         case slotIndex = "slot_index", slotID = "slot_id"
     }
     // Merge history facts only. Missing legacy connected_at is not evidence
@@ -83,9 +85,17 @@ extension CallRecord {
             sourceCallID: try values.decodeIfPresent(String.self, forKey: .sourceCallID),
             historyEstimated: try values.decodeIfPresent(Bool.self, forKey: .historyEstimated),
             slotIndex: try values.decodeIfPresent(Int.self, forKey: .slotIndex),
-            slotID: try values.decodeIfPresent(Int.self, forKey: .slotID)
+            slotID: try values.decodeIfPresent(Int.self, forKey: .slotID),
+            importedDetails: try values.decodeIfPresent(ImportedCallDetails.self, forKey: .importedDetails)
         )
     }
+}
+
+struct ImportedCallDetails: Codable, Equatable, Sendable {
+    let service: String
+    let line: String?
+    let answered: Bool?
+    let duration: TimeInterval?
 }
 
 /// 通话轮询结果；额外音频诊断字段由专门接口读取。

@@ -22,7 +22,9 @@ final class IPhoneCarrierMessaging: ObservableObject {
     @Published private(set) var lastError: String?
     @Published private(set) var notificationsEnabled: Bool?
     private var listeners: [Task<Void, Never>] = []
+    private var mailboxRetry: Task<Void, Never>?
     private var pendingWrites: [String: IPhoneCarrierRecord] = [:]
+    private var pendingReceipts: [String: [String]] = [:]
     private var activeDownloads: Set<String> = []
     private init() {}
 
@@ -44,6 +46,11 @@ final class IPhoneCarrierMessaging: ObservableObject {
             for record in pendingWrites.values.sorted(by: { $0.date < $1.date }) {
                 do { try await receive(record) } catch { lastError = error.localizedDescription }
             }
+            let receipts = pendingReceipts
+            pendingReceipts.removeAll()
+            for (id, statuses) in receipts {
+                for status in statuses { applyReceipt(id: id, status: status) }
+            }
             if #available(iOS 26, *), isConfigured {
                 do {
                     for record in try IPhoneMailbox.shared.pendingRCSDownloads() { enqueueDownload(for: record) }
@@ -54,6 +61,8 @@ final class IPhoneCarrierMessaging: ObservableObject {
               TelephonyMessagingSession.shared.isConfiguredForCarrierMessaging else {
             listeners.forEach { $0.cancel() }
             listeners.removeAll()
+            mailboxRetry?.cancel()
+            mailboxRetry = nil
             lines = []
             isConfigured = false
             lastError = nil
@@ -63,6 +72,23 @@ final class IPhoneCarrierMessaging: ObservableObject {
         let session = TelephonyMessagingSession.shared
         refreshLines(session)
         guard listeners.isEmpty else { return }
+        // iOS queues carrier messages while we are unavailable. A cold wake can occur
+        // before the first unlock, when the local protected database cannot store them.
+        do {
+            try IPhoneMailbox.shared.requireWritable()
+            mailboxRetry?.cancel()
+            mailboxRetry = nil
+        } catch {
+            lastError = error.localizedDescription
+            if mailboxRetry == nil {
+                mailboxRetry = Task {
+                    do { try await Task.sleep(nanoseconds: 15_000_000_000) } catch { return }
+                    mailboxRetry = nil
+                    refresh()
+                }
+            }
+            return
+        }
         listen { [self] in
             for await _ in session.cellularServiceStateUpdates { refreshLines(session) }
         }
@@ -162,13 +188,27 @@ final class IPhoneCarrierMessaging: ObservableObject {
     static func mmsGroupID(from sender: String, recipients: [String]) throws -> String? {
         // Apple omits the current user in its incoming MMS example. A sender
         // plus a single different address already forms a group.
-        let members = Set(([sender] + recipients).filter { !$0.isEmpty }).sorted()
-        guard !sender.isEmpty, members.count > 1 else { return nil }
+        let addresses = ([sender] + recipients).map { raw in
+            SystemCommunicationURL.dialableNumber(from: raw) ?? raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let members = Set(addresses.filter { !$0.isEmpty }).sorted()
+        guard addresses.first?.isEmpty == false, members.count > 1 else { return nil }
         return try JSONEncoder().encode(members).base64EncodedString()
     }
 
     private func recordID(_ raw: String, kind: String, line: String, outgoing: Bool) -> String {
         "\(kind):\(line):\(outgoing ? "out" : "in"):\(raw)"
+    }
+
+    private func applyReceipt(id: String, status: String) {
+        do {
+            try IPhoneMailbox.shared.updateStatus(id: id, to: status)
+        } catch IPhoneMailboxError.unavailable {
+            // A receipt can refer to a message sent by the previous default app.
+        } catch {
+            if pendingReceipts[id]?.last != status { pendingReceipts[id, default: []].append(status) }
+            lastError = error.localizedDescription
+        }
     }
 
     @available(iOS 26, *)
@@ -275,18 +315,34 @@ final class IPhoneCarrierMessaging: ObservableObject {
             default: status = "投递异常"
             }
             let lineID = try encodedKey(message.cellularServiceID)
-            try IPhoneMailbox.shared.updateStatus(id: recordID(receipt.disposedMessageID.rawValue,
-                kind: "RCS", line: lineID, outgoing: true), to: status)
+            applyReceipt(id: recordID(receipt.disposedMessageID.rawValue,
+                kind: "RCS", line: lineID, outgoing: true), status: status)
             return
         case .composingIndicator: return
         default:
             body = "RCS 富媒体消息"
             attachments = [IPhoneCarrierAttachment(name: "RCS-消息.json", mimeType: "application/json",
                 data: try JSONEncoder().encode(message))]
+            let cards: [RCSService.Business.Card.Content]
+            switch content {
+            case .businessCard(let card): cards = [card.content]
+            case .businessCardCarousel(let carousel): cards = carousel.contents
+            default: cards = []
+            }
+            let cardText = cards.flatMap { [$0.title, $0.description].compactMap { $0 } }.joined(separator: "\n")
+            if !cardText.isEmpty { body = cardText }
             if #available(iOS 27, *) {
                 switch content {
-                case .reaction(let item): encrypted = encrypted || item.isEndToEndEncrypted
-                case .customReaction(let item): encrypted = encrypted || item.isEndToEndEncrypted
+                case .reaction(let item):
+                    encrypted = encrypted || item.isEndToEndEncrypted
+                    switch item.operation {
+                    case .addEmoji(let emoji): body = "回应了 \(emoji)"
+                    case .removeEmoji(let emoji): body = "移除了回应 \(emoji)"
+                    @unknown default: break
+                    }
+                case .customReaction(let item):
+                    encrypted = encrypted || item.isEndToEndEncrypted
+                    body = "自定义回应"
                 default: break
                 }
             }
@@ -359,7 +415,7 @@ final class IPhoneCarrierMessaging: ObservableObject {
             guard !encrypted, session.mmsService.isViable(for: state.id) else { throw MessagingError.unavailable }
             if let groupID { recipients = try decodeGroup(groupID, as: [String].self) }
             guard !recipients.isEmpty else { throw MessagingError.invalidGroup }
-            recipients = try recipients.map(validatedAddress)
+            recipients = try Array(Set(recipients.map(validatedAddress))).sorted()
             rcsDestination = nil
         case "RCS":
             guard session.rcsService.isViable(for: state.id) else { throw MessagingError.unavailable }

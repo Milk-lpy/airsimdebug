@@ -1,10 +1,13 @@
 import argparse
+import base64
+from datetime import date
 import hashlib
 import json
 from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from export_iphone_history import APPLE_EPOCH, body_text, run
 
@@ -18,7 +21,7 @@ class ExportTest(unittest.TestCase):
         self.calls = self.root / "CallHistory.storedata"
 
     def options(self, output="history.json", **extra):
-        return argparse.Namespace(**dict(dict(output=self.root / output, source_id="one",
+        return argparse.Namespace(**dict(dict(output=self.root / output, source_id="one", attachments_dir=None, from_date=None, before_date=None,
                                               calls_db=None, sms_db=None, sms_wal=None, calls_wal=None), **extra))
 
     def make_sms(self, db):
@@ -78,6 +81,8 @@ class ExportTest(unittest.TestCase):
         other = self.options("repeated.json", sms_db=self.sms, calls_db=self.calls)
         run(other)
         self.assertEqual(json.loads(other.output.read_text()), export)
+        empty_window = self.options("window.json", sms_db=self.sms, calls_db=self.calls, before_date=date(2005,1,1))
+        self.assertEqual(run(empty_window)["messages"], 0)
         with self.assertRaises(FileExistsError):
             run(opt)
 
@@ -105,6 +110,67 @@ class ExportTest(unittest.TestCase):
             self.assertEqual(body_text(blob), text)
             self.assertIsNone(body_text(blob[:-6]))
         self.assertIsNone(body_text(b"unrelated \x01+\x03abc\x86"))
+
+    def test_only_linked_attachments_inside_chosen_directory_are_embedded(self):
+        folder = self.root / "Attachments"
+        (folder / "aa").mkdir(parents=True)
+        (folder / "aa" / "cat.jpg").write_bytes(b"expected photo")
+        (folder / "unused.dat").write_bytes(b"unrelated")
+        outside = self.root / "not-selected.dat"
+        outside.write_bytes(b"private file")
+        files = [("~/Library/SMS/Attachments/aa/cat.jpg", "image/jpeg", "../photo.jpg"),
+                 ("~/Library/SMS/Attachments/../not-selected.dat", None, None),
+                 (str(outside), None, None), ("aa/missing.gif", None, None),
+                 ("C:\\Private\\x", None, None)]
+        try:
+            (folder / "aa" / "symlink").symlink_to(outside)
+            (folder / "alias").symlink_to(self.root, target_is_directory=True)
+        except OSError:
+            pass  # Windows may disallow test-created symlinks.
+        else:
+            files += [("aa/symlink", None, None), ("alias/not-selected.dat", None, None)]
+        with sqlite3.connect(self.sms) as db:
+            self.make_sms(db)
+            db.execute("CREATE TABLE attachment(filename TEXT, mime_type TEXT, transfer_name TEXT)")
+            db.executemany("INSERT INTO attachment VALUES(?,?,?)", files)
+            # Synthetic chat already has an attachment link for ID 1. Include it
+            # again to check duplicate joins, and put all bad links on this message.
+            db.executemany("INSERT INTO message_attachment_join VALUES(3,?)", [(i,) for i in range(1,len(files)+1)])
+            db.execute("INSERT INTO chat_message_join VALUES(2,3)")
+        plain = self.options(sms_db=self.sms)
+        run(plain)
+        opts = self.options("images.json", sms_db=self.sms, attachments_dir=folder)
+        stats = run(opts)
+        records = json.loads(opts.output.read_text())["messages"]
+        previous = json.loads(plain.output.read_text())["messages"]
+        self.assertEqual([r["id"] for r in records], [r["id"] for r in previous])
+        message = next(row for row in records if row["service"] == "iMessage")
+        self.assertEqual(message["attachments"], [{"name": "photo.jpg", "mimeType": "image/jpeg",
+                                                     "data": base64.b64encode(b"expected photo").decode()}])
+        self.assertEqual(message["text"], "[附件]")
+        self.assertEqual(stats["attachments"], 1)
+        self.assertEqual(stats["unavailable_attachments"], len(files)-1)
+        self.assertNotIn(base64.b64encode(b"private file").decode(), opts.output.read_text())
+        self.assertNotIn(base64.b64encode(b"unrelated").decode(), opts.output.read_text())
+
+    def test_oversized_file_or_package_fails_without_discarding_the_record(self):
+        folder = self.root / "files"
+        folder.mkdir()
+        (folder / "voice.amr").write_bytes(b"voice recording")
+        with sqlite3.connect(self.sms) as db:
+            self.make_sms(db)
+            db.execute("CREATE TABLE attachment(filename TEXT)")
+            db.execute("INSERT INTO attachment VALUES('voice.amr')")
+        opts = self.options(sms_db=self.sms, attachments_dir=folder)
+        with patch("export_iphone_history.FILE_LIMIT", 4), self.assertRaisesRegex(ValueError, "32 MB"):
+            run(opts)
+        self.assertFalse(opts.output.exists())
+        with patch("export_iphone_history.PACK_LIMIT", 32), self.assertRaisesRegex(ValueError, "128 MB"):
+            run(opts)
+        self.assertFalse(opts.output.exists())
+        opts.before_date = date(2005,1,1)
+        with patch("export_iphone_history.FILE_LIMIT", 4):
+            self.assertEqual(run(opts)["attachments"], 0)
 
     def test_invalid_db_preserves_existing_output_and_creates_no_partial_file(self):
         self.sms.write_bytes(b"not sqlite")
