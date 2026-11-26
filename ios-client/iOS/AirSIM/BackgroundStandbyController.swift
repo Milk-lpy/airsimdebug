@@ -290,6 +290,14 @@ final class AirSIMNotificationDelegate: NSObject, UIApplicationDelegate, @precon
         withCompletionHandler completionHandler: @escaping () -> Void
     ) {
         let actionIdentifier = response.actionIdentifier
+        let notificationInfo = response.notification.request.content.userInfo
+        if notificationInfo["event"] as? String == "iphone_carrier_message",
+           actionIdentifier == UNNotificationDefaultActionIdentifier,
+           let id = notificationInfo["record_id"] as? String {
+            IPhoneMailbox.shared.openNotification(id: id)
+            completionHandler()
+            return
+        }
         if response.notification.request.content.userInfo["event"] as? String == "other_android_incoming" {
             let info = response.notification.request.content.userInfo
             OtherAndroidCallPresentationRequest.mark(info)

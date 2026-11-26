@@ -891,6 +891,7 @@ struct AirSIMSettingsView: View {
             Section { link(.guide, "book") }
         case .diagnostics:
             Section {
+                IPhoneIntegrationDiagnosticsButton()
                 link(.localCheck, "wifi")
                 link(.bluetoothStatus, "wave.3.right")
                 link(.cloudCheck, "cloud", detail: pureLocalEnabled ? "纯本地模式下不可运行" : nil)

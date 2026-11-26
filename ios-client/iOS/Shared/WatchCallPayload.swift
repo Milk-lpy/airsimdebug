@@ -22,6 +22,11 @@ enum HomeRelayWirePolicy {
         return c.scheme?.lowercased() == "https"
     }
 
+    static func permitsPCM(_ assignedTransport: Any?) -> Bool {
+        // Old Relay descriptors omit the field and carry the original PCM protocol.
+        assignedTransport == nil || (assignedTransport as? String) == "legacy_pcm"
+    }
+
     static func permitsMedia(_ c: URLComponents, callUUID: UUID? = nil) -> Bool {
         guard c.host?.isEmpty == false, c.user == nil, c.password == nil, c.fragment == nil,
               c.port.map({ (1...65535).contains($0) }) ?? true else { return false }
@@ -315,7 +320,7 @@ struct WatchVoIPCall: Equatable, Sendable {
                 URLQueryItem(name: "token", value: secret),
             ]
             guard let url = components.url else { throw WatchVoIPPayloadError.invalidMediaURL }
-            media = .cloud(url)
+            media = HomeRelayWirePolicy.permitsPCM(userInfo["media_transport"]) ? .cloud(url) : .pendingLocal
         } else {
             media = .pendingLocal
         }

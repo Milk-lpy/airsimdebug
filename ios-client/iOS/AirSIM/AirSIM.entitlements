@@ -8,7 +8,7 @@
 	<string>$(APS_ENVIRONMENT)</string>
 	<key>com.apple.developer.calling-app</key>
 	<true/>
-	<key>com.apple.developer.messaging-app</key>
+	<key>com.apple.developer.dialing-app</key>
 	<true/>
 	<key>keychain-access-groups</key>
 	<array>

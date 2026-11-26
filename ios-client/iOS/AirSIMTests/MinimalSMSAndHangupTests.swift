@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import SQLite3
 import XCTest
 import UIKit
 @testable import AirSIM
@@ -61,21 +62,110 @@ final class CallbackSIMDialChoiceTests: XCTestCase {
         [{"id":"voice-one","label":"SIM 1","slot_index":0},{"id":"voice-two","label":"SIM 2","slot_index":1}]
         """.utf8))
     }
-    func testBothExplicitSlotsKeepOriginalCallbackNumber() {
-        let request = CallbackSIMDialRequest(agentID: "A", number: "+8613800138000", slots: slots)
-        for slot in slots { XCTAssertTrue(request.permits(agentID: "A", liveSlots: slots, slotID: slot.id, callInProgress: false)) }
-        XCTAssertEqual(request.number, "+8613800138000")
+    private let primary = IPhoneCellularLine(id: UUID(), label: "主号")
+    private let secondary = IPhoneCellularLine(id: UUID(), label: "副号")
+    private func roster(_ agent: String?, slots: [AndroidSIMSlot], local: [IPhoneCellularLine]) -> [DialLineChoice] {
+        DialLineChoice.roster(agentID: agent, slots: slots, hasAndroid: agent != nil, local: local, supportsSystem: true)
     }
-    func testRemovedSIMAndDeviceSwitchCannotDialAnotherCard() {
-        let request = CallbackSIMDialRequest(agentID: "A", number: "10086", slots: slots)
-        XCTAssertFalse(request.permits(agentID: "B", liveSlots: slots, slotID: "voice-two", callInProgress: false))
-        XCTAssertFalse(request.permits(agentID: "A", liveSlots: [slots[0]], slotID: "voice-two", callInProgress: false))
-        XCTAssertFalse(request.permits(agentID: "A", liveSlots: slots, slotID: "unknown", callInProgress: false))
+
+    func testBothIPhoneLinesAndAndroidSlotsKeepExactRouteAndCallbackNumber() {
+        let choices = roster("A", slots: slots, local: [primary, secondary])
+        let expected: [DialLineID] = [.android(agentID: "A", slotID: "voice-one"), .android(agentID: "A", slotID: "voice-two"),
+            .iPhone(primary.id), .iPhone(secondary.id), .system]
+        XCTAssertEqual(choices.map(\.id), expected)
+        let request = DialLineRequest(number: "+8613800138000", choices: choices)
+        for route in expected {
+            XCTAssertTrue(request.permits(route, number: request.number, live: choices, idle: true))
+            XCTAssertFalse(request.permits(route, number: "10010", live: choices, idle: true))
+            XCTAssertFalse(request.permits(route, number: request.number, live: choices, idle: false))
+        }
     }
-    func testIncomingCallBlocksPendingCallback() {
-        let request = CallbackSIMDialRequest(agentID: "A", number: "10086", slots: slots)
-        XCTAssertFalse(request.permits(agentID: "A", liveSlots: slots, slotID: "voice-one", callInProgress: true))
+
+    func testRemovedSIMOrDeviceSwitchCannotRetargetTheCapturedChoice() {
+        let request = DialLineRequest(number: "10086", choices: roster("A", slots: slots, local: [primary]))
+        let route = DialLineID.android(agentID: "A", slotID: "voice-two")
+        XCTAssertFalse(request.permits(route, number: request.number, live: roster("B", slots: slots, local: [primary]), idle: true))
+        XCTAssertFalse(request.permits(route, number: request.number, live: roster("A", slots: [slots[0]], local: []), idle: true))
+        XCTAssertFalse(request.permits(.iPhone(primary.id), number: request.number, live: roster("A", slots: slots, local: [secondary]), idle: true))
+        XCTAssertFalse(request.permits(.iPhone(secondary.id), number: request.number, live: roster("A", slots: slots, local: [secondary]), idle: true))
     }
+
+    func testLocalRoutesRemainSelectableWithoutAndroid() {
+        let localOnly = roster(nil, slots: [], local: [primary, secondary])
+        XCTAssertEqual(localOnly.map(\.id), [.iPhone(primary.id), .iPhone(secondary.id), .system])
+        XCTAssertEqual(roster(nil, slots: [], local: []).map(\.id), [.system])
+        XCTAssertTrue(DialLineChoice.roster(agentID: nil, slots: [], hasAndroid: false, local: [], supportsSystem: false).isEmpty)
+    }
+
+    func testStoredRoutesSurviveRelaunchAndMissingCardDoesNotFallBack() throws {
+        let choices = roster("A", slots: slots, local: [primary, secondary])
+        for choice in choices {
+            let saved = DialLinePreference(data: try JSONEncoder().encode(choice.id))
+            XCTAssertEqual(saved.resolve(in: choices)?.id, choice.id)
+            let remaining = choices.filter { $0.id != choice.id }
+            XCTAssertNil(saved.resolve(in: remaining))
+        }
+        let data = try JSONEncoder().encode(DialLineID.iPhone(primary.id))
+        let preference = DialLinePreference(data: data)
+        XCTAssertNil(preference.resolve(in: roster(nil, slots: [], local: [])))
+        XCTAssertEqual(preference.resolve(in: roster(nil, slots: [], local: [secondary, primary]))?.id, .iPhone(primary.id))
+        XCTAssertNil(DialLinePreference(data: Data("invalid".utf8)).resolve(in: choices))
+    }
+
+    func testUnsetAndOldAutomaticRequireExplicitChoiceEvenWhenLinesChange() {
+        let unset = DialLinePreference(data: Data())
+        XCTAssertEqual(unset, .unselected)
+        for choices in [roster(nil, slots: [], local: []), roster(nil, slots: [], local: [primary]),
+                        roster("A", slots: slots, local: [primary, secondary])] {
+            XCTAssertNil(unset.resolve(in: choices))
+            XCTAssertEqual(DialLinePreference.chosen(.system).resolve(in: choices)?.id, .system)
+        }
+    }
+
+    @MainActor func testRelayMediaPolicyPreservesIncomingIdentityWithoutOpeningUnsupportedAudio() async throws {
+        let uuid = UUID()
+        let url = try XCTUnwrap(URL(string: "wss://relay.example.invalid/v1/calls/\(uuid.uuidString)/connect"))
+        let secret = String(repeating: "x", count: 32)
+        let base: [AnyHashable: Any] = ["event": "incoming_call", "call_id": "test", "call_uuid": uuid.uuidString,
+                                      "call_secret": secret, "media_url": url.absoluteString]
+        for (assigned, supported) in [(nil, true), ("legacy_pcm", true), ("webrtc", false), ("unknown", false), ("", false)] as [(String?, Bool)] {
+            var payload = base
+            payload["media_transport"] = assigned
+            let incoming = try IncomingVoIPCall(userInfo: payload)
+            XCTAssertEqual(incoming.uuid, uuid)
+            XCTAssertEqual(incoming.supportsCloudPCM, supported)
+            XCTAssertEqual(try WatchVoIPCall(userInfo: payload).authenticatedMediaURL != nil, supported)
+            let outgoing = try IncomingVoIPCall(outgoingCallID: "test", uuid: uuid, number: "10086",
+                                               secret: secret, mediaURL: url, assignedTransport: assigned)
+            XCTAssertEqual(outgoing.supportsCloudPCM, supported)
+            if !supported {
+                do {
+                    try await IPhoneCloudCallSession.shared.answer(incoming)
+                    XCTFail("Unsupported media must fail before opening an audio session")
+                } catch IPhoneCloudCallError.unsupportedTransport {}
+            }
+        }
+        XCTAssertFalse(HomeRelayWirePolicy.permitsPCM(1))
+    }
+
+    func testNativeVoiceInventoryReportsOnlyActualServicesAndHidesIdentifiersInDiagnostics() throws {
+        let suite = "airsim.test.lines." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(try JSONEncoder().encode(DialLineID.iPhone(primary.id)), forKey: DialLinePreference.storageKey)
+        XCTAssertNotEqual(IPhoneCellularLineInventory.notQueried.summary, IPhoneCellularLineInventory.reported([]).summary)
+        let duplicateLabel = IPhoneCellularLine(id: UUID(), label: primary.label)
+        for lines in [[], [primary], [duplicateLabel, primary]] {
+            let inventory = IPhoneCellularLineInventory.reported(lines)
+            XCTAssertTrue(inventory.summary.contains("\(lines.count) 条"))
+            XCTAssertEqual(inventory.lines.map(\.id), lines.map(\.id))
+            let summary = DialLinePreference.storedSummary(in: inventory, defaults: defaults)
+            XCTAssertTrue(summary.contains(lines.isEmpty ? "未返回" : "可见"))
+            XCTAssertFalse(summary.contains(primary.id.uuidString))
+            XCTAssertFalse(summary.contains(primary.label))
+        }
+    }
+
 }
 
 final class ExternalDialHandoffTests: XCTestCase {
@@ -94,7 +184,7 @@ final class ExternalDialHandoffTests: XCTestCase {
     }
 
     func testMalformedLinksDoNotProduceDialTargets() throws {
-        for link in ["tel:?10086", "tel:12345;ext=6789", "tel:12%0A34", "tel:123+45", "tel:%2B"] {
+        for link in ["im:10086", "sms:10086", "tel:?10086", "tel:12345;ext=6789", "tel:12%0A34", "tel:123+45", "tel:%2B"] {
             let url = try XCTUnwrap(URL(string: link))
             XCTAssertNil(SystemCommunicationURL.destination(for: url))
         }
@@ -369,5 +459,220 @@ final class AndroidFilteredSMSHandoffTests: XCTestCase {
         XCTAssertEqual(Set(obj.keys), ["allow", "rules"])
         XCTAssertEqual(obj["allow"] as? [String], ["10001"])
         XCTAssertEqual((obj["rules"] as? [[String: String]])?.first, ["target": "content", "keyword": "测试"])
+    }
+}
+
+final class HistoricalCallDialTests: XCTestCase {
+    func testImportedFaceTimeEmailIsNotTreatedAsAnAndroidDialTarget() {
+        XCTAssertNil(RecentCallDialPolicy.numberToDial("name@example.invalid", imported: true))
+        XCTAssertEqual(RecentCallDialPolicy.numberToDial("tel:%2B1%20555-0100", imported: true), "+15550100")
+        XCTAssertEqual(RecentCallDialPolicy.numberToDial("555 0100", imported: true), "5550100")
+    }
+}
+
+final class IPhoneMailboxTests: XCTestCase {
+    private func directory() throws -> URL {
+        let result = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: result, withIntermediateDirectories: false)
+        addTeardownBlock { try FileManager.default.removeItem(at: result) }
+        return result
+    }
+
+    private func message(_ id: String, line: String = "line-one", outgoing: Bool = false) -> IPhoneCarrierRecord {
+        IPhoneCarrierRecord(id: id, lineID: line, lineLabel: line, peer: "5550100",
+                            kind: "RCS", body: "fixture", date: Date(timeIntervalSince1970: 100),
+                            outgoing: outgoing, status: outgoing ? "发送中" : "")
+    }
+
+    @MainActor func testDuplicateReceiveAndTwoLinesStayIsolatedAfterReopen() throws {
+        let location = try directory()
+        let one = message("1"), two = message("2", line: "line-two")
+        let box = IPhoneMailbox(directory: location)
+        XCTAssertTrue(try box.insert(one))
+        try box.markRead(thread: one.threadID)
+        XCTAssertFalse(try box.insert(one))
+        XCTAssertTrue(try box.insert(two))
+        let reopened = IPhoneMailbox(directory: location)
+        XCTAssertNotEqual(one.threadID, two.threadID)
+        XCTAssertEqual(Set(try reopened.latestThreads().map(\.id)), Set(["1", "2"]))
+        XCTAssertEqual(try reopened.unreadThreads(), Set([two.threadID]))
+        try reopened.remove(thread: one.threadID)
+        XCTAssertEqual(try reopened.latestThreads().map(\.id), ["2"])
+    }
+
+    @MainActor func testLateAcknowledgementsCannotRegressDeliveryOrReadReceipt() throws {
+        let box = IPhoneMailbox(directory: try directory())
+        let item = message("pending", outgoing: true)
+        XCTAssertTrue(try box.insert(item))
+        for status in ["已送达", "已发送", "发送未确认"] { try box.updateStatus(id: item.id, to: status) }
+        XCTAssertEqual(try box.latestThreads().first?.status, "已送达")
+        for status in ["已读", "已送达", "投递异常", "已发送"] { try box.updateStatus(id: item.id, to: status) }
+        XCTAssertEqual(try box.latestThreads().first?.status, "已读")
+    }
+
+    @MainActor func testImportIsAtomicIdempotentAndReadOnlyThreadsRemainSeparate() throws {
+        let box = IPhoneMailbox(directory: try directory())
+        let live = message("live")
+        XCTAssertTrue(try box.insert(live))
+        let messageID = String(repeating: "a", count: 64), callID = String(repeating: "b", count: 64)
+        let msg = IPhoneMailbox.Migration.Message(id: messageID, threadID: "backup-thread", title: "5550100",
+            direction: "incoming", service: "SMS", text: "import", timestamp: 99, readOnly: true,
+            peer: "5550100", sender: nil, line: "line-one")
+        func call(_ id: String) -> IPhoneMailbox.Migration.Call {
+            .init(id: id, direction: "incoming", service: "cellular", timestamp: 90,
+                  number: "5550100", line: "line-two", systemID: nil, duration: 0, answered: false)
+        }
+        func archive(_ id: String) -> IPhoneMailbox.Migration {
+            .init(format: "airsim-iphone-history", version: 1, messages: [msg], calls: [call(id)])
+        }
+        XCTAssertThrowsError(try box.merge(archive("invalid-id")))
+        XCTAssertEqual(try box.latestThreads().map(\.id), [live.id])
+        XCTAssertTrue(box.importedCalls.isEmpty)
+
+        let counts = try box.merge(archive(callID))
+        XCTAssertEqual(counts.0, 1)
+        XCTAssertEqual(counts.1, 1)
+        let repeated = try box.merge(archive(callID))
+        XCTAssertEqual(repeated.0, 0)
+        XCTAssertEqual(repeated.1, 0)
+        let imported = try XCTUnwrap(try box.latestThreads().first { $0.importedThread != nil })
+        XCTAssertNotEqual(imported.threadID, live.threadID)
+        XCTAssertTrue(try box.unreadThreads().contains(live.threadID))
+        XCTAssertFalse(try box.unreadThreads().contains(imported.threadID))
+        XCTAssertEqual(box.importedCalls.map(\.id), ["iphone-import:" + callID])
+        XCTAssertEqual(box.importedCalls.first?.missed, true)
+        XCTAssertEqual(box.importedCalls.first?.importedDetails,
+                       ImportedCallDetails(service: "cellular", line: "line-two", answered: false, duration: 0))
+        XCTAssertNil(box.importedCalls.first?.connectedAt)
+        XCTAssertNil(box.importedCalls.first?.endedAt)
+        try box.removeImportedCall(id: "iphone-import:" + callID)
+        XCTAssertTrue(box.importedCalls.isEmpty)
+        XCTAssertEqual(try box.messages(thread: live.threadID, limit: 10).count, 1)
+    }
+
+    @MainActor func testImportAddsMissingMediaOnce() throws {
+        let box = IPhoneMailbox(directory: try directory())
+        let id = String(repeating: "d", count: 64)
+        var msg = IPhoneMailbox.Migration.Message(id: id, threadID: "backup-thread", title: "Test", direction: "incoming",
+            service: "iMessage", text: "[附件]", timestamp: 100, readOnly: true, peer: nil, sender: nil, line: nil)
+        func load() throws {
+            _ = try box.merge(.init(format: "airsim-iphone-history", version: 1, messages: [msg], calls: []))
+        }
+        try load()
+        msg.attachments = [.init(name: "one.txt", mimeType: "text/plain", data: Data([65,66]))]
+        try load()
+        XCTAssertEqual(box.lastImportAttachmentCount, 1)
+        try load()
+        XCTAssertEqual(box.lastImportAttachmentCount, 0)
+        let thread = try XCTUnwrap(try box.latestThreads().first)
+        XCTAssertEqual(thread.attachments.count, 1)
+        XCTAssertEqual(try box.attachment(id: thread.id, index: 0), Data([65,66]))
+    }
+
+    @MainActor func testExclusiveDatabaseLockCannotReplaceMessagesWithEmptyStorage() throws {
+        let location = try directory()
+        let original = IPhoneMailbox(directory: location)
+        XCTAssertTrue(try original.insert(message("before")))
+        var lock: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(location.appendingPathComponent("mail.sqlite").path, &lock,
+                                       SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        defer { sqlite3_close(lock) }
+        XCTAssertEqual(sqlite3_exec(lock, "BEGIN EXCLUSIVE", nil, nil, nil), SQLITE_OK)
+        XCTAssertThrowsError(try original.requireWritable())
+        XCTAssertThrowsError(try original.insert(message("during")))
+        XCTAssertEqual(sqlite3_exec(lock, "ROLLBACK", nil, nil, nil), SQLITE_OK)
+        let reopened = IPhoneMailbox(directory: location)
+        XCTAssertNoThrow(try reopened.requireWritable())
+        XCTAssertEqual(try reopened.latestThreads().map(\.id), ["before"])
+        XCTAssertTrue(try reopened.insert(message("after", line: "line-two")))
+        XCTAssertEqual(Set(try reopened.latestThreads().map(\.id)), Set(["before", "after"]))
+    }
+
+    @MainActor func testUnreadableStoreIsReportedWithoutReplacingOriginalBytes() throws {
+        let location = try directory()
+        let path = location.appendingPathComponent("mail.sqlite")
+        let original = Data(repeating: 0x61, count: 512)
+        try original.write(to: path)
+        let box = IPhoneMailbox(directory: location)
+        XCTAssertNotNil(box.lastError)
+        XCTAssertThrowsError(try box.insert(message("must-not-replace")))
+        XCTAssertEqual(try Data(contentsOf: path), original)
+    }
+}
+
+final class IPhoneSigningDiagnosticsTests: XCTestCase {
+    private func signingTLV(_ tag: UInt8, _ bytes: [UInt8]) -> [UInt8] {
+        let n = bytes.count
+        if n < 128 { return [tag, UInt8(n)] + bytes }
+        if n < 256 { return [tag, 0x81, UInt8(n)] + bytes }
+        return [tag, 0x82, UInt8(n >> 8), UInt8(n & 255)] + bytes
+    }
+
+    private func signingImage(der: [UInt8]?, xml: [UInt8]? = nil) -> Data {
+        func word(_ n: Int, little: Bool = false) -> [UInt8] {
+            let big: [UInt8] = [24, 16, 8, 0].map { UInt8(truncatingIfNeeded: n >> $0) }
+            return little ? Array(big.reversed()) : big
+        }
+        var slots: [(Int, [UInt8])] = []
+        if let xml { slots.append((5, word(0xfade7171) + word(xml.count + 8) + xml)) }
+        if let der { slots.append((7, word(0xfade7172) + word(der.count + 8) + der)) }
+        let start = 12 + 8 * slots.count
+        var indices: [UInt8] = [], payload: [UInt8] = []
+        for (id, blob) in slots {
+            indices += word(id) + word(start + payload.count)
+            payload += blob
+        }
+        var signature = word(0xfade0cc0) + word(start + payload.count) + word(slots.count)
+        signature += indices + payload
+        let header = [0xfeedfacf, 0x0100000c, 0, 2, 1, 16, 0, 0].flatMap { word($0, little: true) }
+        let command = [0x1d, 16, 48, signature.count].flatMap { word($0, little: true) }
+        return Data(header + command + signature)
+    }
+
+    private func signingEntry(_ suffix: String, _ value: [UInt8]) -> [UInt8] {
+        let key = Array(("com.apple.developer." + suffix).utf8)
+        return signingTLV(0x30, signingTLV(0x0c, key) + value)
+    }
+
+    private func signingProfile(_ fields: [String: Any]) throws -> Data {
+        let plist = try PropertyListSerialization.data(fromPropertyList: ["Entitlements": fields], format: .xml, options: 0)
+        let oid: [UInt8] = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 7]
+        let split = plist.count / 2
+        let chunks = signingTLV(4, Array(plist.prefix(split))) + signingTLV(4, Array(plist.dropFirst(split)))
+        let content = signingTLV(6, oid + [1]) + signingTLV(0xa0, signingTLV(0x24, chunks))
+        let signed = signingTLV(2, [1]) + signingTLV(0x31, []) + signingTLV(0x30, content) + signingTLV(0x31, [])
+        // CMS allows indefinite lengths and split octet strings. An unsigned fixture is sufficient to read fields.
+        return Data([0x30, 0x80] + signingTLV(6, oid + [2]) + signingTLV(0xa0, signingTLV(0x30, signed)) + [0, 0])
+    }
+
+    func testSigningReadsModernDERBeforeXMLAndChecksStrictProfileTypes() throws {
+        let entries = signingEntry("dialing-app", [1, 1, 255]) + signingEntry("calling-app", [1, 1, 0])
+        let modern = signingTLV(0x70, signingTLV(2, [1]) + signingTLV(0xb0, entries))
+        let xml = try PropertyListSerialization.data(fromPropertyList: ["com.apple.developer.dialing-app": false],
+                                                       format: .xml, options: 0)
+        let profile = try signingProfile([
+            "com.apple.developer.dialing-app": true,
+            "com.apple.developer.calling-app": 1
+        ])
+        let rows = IPhoneSigningDiagnostics.rows(executable: signingImage(der: modern, xml: Array(xml)), profile: profile)
+        XCTAssertEqual(rows[0].1, "主 App 签名 · DER · false\n描述文件可读字段 · 字段类型异常")
+        XCTAssertEqual(rows[1].1, "主 App 签名 · DER · true\n描述文件可读字段 · true")
+        XCTAssertEqual(rows.count, 2)
+    }
+
+    func testSigningReadsLegacyDERAndMarksMalformedAndFallbackSources() throws {
+        let legacy = signingTLV(0x31, signingEntry("dialing-app", [2, 1, 1]))
+        let legacyRows = IPhoneSigningDiagnostics.rows(executable: signingImage(der: legacy), profile: nil)
+        XCTAssertTrue(legacyRows[1].1.contains("DER · 字段类型异常"))
+        let truncated = Array(legacy.dropLast())
+        let xml = try PropertyListSerialization.data(fromPropertyList: ["com.apple.developer.dialing-app": true],
+                                                       format: .xml, options: 0)
+        let fallback = IPhoneSigningDiagnostics.rows(executable: signingImage(der: truncated, xml: Array(xml)), profile: nil)
+        XCTAssertTrue(fallback[1].1.contains("XML（DER 不可读取） · true"))
+        let invalid = IPhoneSigningDiagnostics.rows(executable: signingImage(der: truncated), profile: Data(xml))
+        XCTAssertTrue(invalid[1].1.contains("主 App 签名 · 不可读取"))
+        XCTAssertTrue(invalid[1].1.contains("描述文件不可读取"))
+        let shortImage = Data(signingImage(der: legacy).dropLast())
+        XCTAssertTrue(IPhoneSigningDiagnostics.rows(executable: shortImage, profile: nil)[1].1.contains("不可读取"))
     }
 }

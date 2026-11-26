@@ -6,7 +6,12 @@ fail() {
     exit 1
 }
 
-[ "$#" -eq 1 ] || fail "Usage: $0 signed.ipa|signed.app|signed.xcarchive"
+scope=auto
+if [ "${1:-}" = --full ]; then
+    scope=full
+    shift
+fi
+[ "$#" -eq 1 ] || fail "Usage: $0 [--full] signed.ipa|signed.app|signed.xcarchive"
 [ "$(uname -s)" = Darwin ] || fail "Run this check on the Mac used to sign AirSIM."
 
 umask 077
@@ -29,38 +34,48 @@ app=$1
 info="$app/Info.plist"
 signed="$work/signed.plist"
 profile="$work/profile.plist"
-key=com.apple.developer.calling-app
-
-read_plist() {
-    /usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null
-}
-
-/usr/bin/codesign -d --entitlements - "$app" > "$signed" 2>/dev/null ||
+/usr/bin/codesign -d --entitlements - --xml "$app" > "$signed" 2>/dev/null ||
     fail "No readable code signature. Use the final package after signing."
-/usr/bin/plutil -lint -s "$signed" ||
-    fail "The signature has no readable entitlement plist."
+[ -f "$app/embedded.mobileprovision" ] ||
+    fail "The sideloaded app has no embedded provisioning profile."
+/usr/bin/security cms -D -i "$app/embedded.mobileprovision" > "$profile" ||
+    fail "Cannot decode the embedded provisioning profile."
 
-signed_calling=$(read_plist "$signed" "$key" || true)
-printf 'Signed Default Calling entitlement: %s\n' "${signed_calling:-missing}"
-if read_plist "$info" UIBackgroundModes | /usr/bin/grep -qx ' *voip'; then
-    voip=yes
-else
-    voip=no
-fi
-printf 'Voice over IP background mode: %s\n' "$voip"
-printf 'Signed APNs environment: %s\n' "$(read_plist "$signed" aps-environment || printf missing)"
+/usr/bin/python3 - "$signed" "$profile" "$info" "$scope" <<'PYTHON'
+import plistlib
+import sys
 
-profile_calling=
-if [ -f "$app/embedded.mobileprovision" ]; then
-    /usr/bin/security cms -D -i "$app/embedded.mobileprovision" > "$profile" ||
-        fail "Cannot decode the embedded provisioning profile."
-    profile_calling=$(read_plist "$profile" "Entitlements:$key" || true)
-    printf 'Embedded profile Default Calling authorization: %s\n' "${profile_calling:-missing}"
-else
-    printf '%s\n' 'Embedded profile: absent. Provisioning cannot be confirmed for a sideloaded app.'
-fi
+def read(path):
+    with open(path, "rb") as stream:
+        return plistlib.load(stream)
 
-[ "$signed_calling" = true ] || fail "The final app signature lacks Default Calling."
-[ "$voip" = yes ] || fail "The final app Info.plist lacks the voip background mode."
-[ "$profile_calling" = true ] || fail "Verify with the profile that authorizes this signed sideload build."
-printf '%s\n' 'Default Calling signing and background-mode checks passed.'
+signature = read(sys.argv[1])
+authorization = read(sys.argv[2]).get("Entitlements", {})
+info = read(sys.argv[3])
+build = str(info.get("CFBundleVersion", "")).split(".")[0]
+full = sys.argv[4] == "full" or (build.isdigit() and int(build) >= 195)
+keys = ["calling-app"]
+if full:
+    keys.append("dialing-app")
+    if build in {"195", "196"}:
+        keys += ["messaging-app", "carrier-messaging-app"]
+    elif build.isdigit() and int(build) >= 197:
+        for suffix in ("messaging-app", "carrier-messaging-app"):
+            if signature.get("com.apple.developer." + suffix):
+                issues.append(f"signature still requests {suffix}")
+
+issues = []
+for suffix in keys:
+    key = "com.apple.developer." + suffix
+    for name, entitlements in (("signature", signature), ("embedded profile", authorization)):
+        if entitlements.get(key) is True:
+            print(f"{name}: {key} = true")
+        else:
+            issues.append(f"{name}: {key} must be boolean true")
+if "voip" not in info.get("UIBackgroundModes", []):
+    issues.append("Info.plist lacks the voip background mode")
+print("Signed APNs environment:", signature.get("aps-environment", "missing"))
+if issues:
+    sys.exit("\n".join(issues))
+print("Default communication entitlements and VoIP background mode verified.")
+PYTHON

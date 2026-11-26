@@ -389,7 +389,9 @@ final class DeviceCallActionRouter {
         targets = targets.filter { context.registry.latestEvent(for: $0.key)?.state.isTerminal == false }
     }
     private func preferred(agentID: String, mode: AirSIMConnectionMode) -> (CallTransport, any DeviceCallBackend)? {
-        let wlan = backend(agentID, .vowlan), ble = backend(agentID, .bluetooth)
+        let policy = ConnectionModeRuntimePolicy(mode: mode)
+        let wlan = policy.startsVoWLAN ? backend(agentID, .vowlan) : nil
+        let ble = policy.startsBluetooth ? backend(agentID, .bluetooth) : nil
         guard let transport = DialRouteSelector.preferred(mode: mode, vowlanReady: wlan != nil,
             bluetoothReady: ble != nil, cloudReady: false), let service = transport == .vowlan ? wlan : ble else { return nil }
         return (transport, service)
